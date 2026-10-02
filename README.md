@@ -2,6 +2,13 @@
 
 Everscale/Venom node and validator with tools
 
+> **This is a fork**: upstream [everx-labs/ever-node](https://github.com/everx-labs/ever-node) plus one
+> feature - a JSON-RPC server inside the node that speaks the
+> [everscale-jrpc](https://github.com/broxus/everscale-jrpc) API: account state, blockchain config,
+> sending messages and the transaction history of listed accounts. The methods, the configuration and
+> the build are in [JRPC.md](JRPC.md). No other source of the node is changed; the dependency versions
+> and the toolchain are pinned.
+
 ## Table of Contents
 
 - [About](#about)

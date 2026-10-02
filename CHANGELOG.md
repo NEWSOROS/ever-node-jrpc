@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## ever-node-jrpc (this fork, on top of version 0.60.11)
+
+- In-process JSON-RPC server: the everscale-jrpc API answered from the node's own state, with an
+  optional transaction history of listed accounts ([JRPC.md](JRPC.md))
+- The example config `configs/default_config.json` switches the server on at `127.0.0.1:8081`
+- `Cargo.lock` is committed and the toolchain is Rust 1.97.1: the build is pinned to what it was
+  tested with
+
 ## Version 0.60.11
 
 - Decreased error severity for wrong REMP blocks enumeration

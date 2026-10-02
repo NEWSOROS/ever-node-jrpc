@@ -147,6 +147,12 @@ pub struct TonNodeConfig {
     #[serde(skip_serializing)]
     control_server_port: Option<u16>,
     control_server: Option<AdnlServerConfigJson>,
+    /// In-process JSON-RPC API (network/jrpc.rs); off when absent. Kept as written and
+    /// parsed on use: a section the node cannot use turns JRPC off, it never stops the
+    /// node from reading its config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    jrpc_server: Option<serde_json::Value>,
     kafka_consumer_config: Option<KafkaConsumerConfig>,
     external_db_config: Option<ExternalDbConfig>,
     default_rldp_roundtrip_ms: Option<u32>,
@@ -497,6 +503,17 @@ impl TonNodeConfig {
             ret.set_port(port)
         }
         Ok(ret)
+    }
+
+    pub fn jrpc_server(&self) -> Option<crate::network::jrpc::JrpcServerConfig> {
+        let section = self.jrpc_server.as_ref()?;
+        match serde_json::from_value(section.clone()) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                log::error!("JRPC server is off: bad jrpc_server section {}: {}", section, e);
+                None
+            }
+        }
     }
 
     pub fn control_server(&self) -> Result<Option<AdnlServerConfig>> {
@@ -2018,5 +2035,61 @@ impl ValidatorKeys {
                 None => return adnl_ids
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod jrpc_config_tests {
+    use super::*;
+
+    #[test]
+    fn jrpc_server_section_survives_the_config_rewrite() {
+        // the node writes config.json back (e.g. when an election adds keys): the section stays
+        let config: TonNodeConfig = serde_json::from_str(
+            r#"{"jrpc_server": {"listen_address": "127.0.0.1:8081"}}"#).expect("config");
+        let jrpc = config.jrpc_server().expect("jrpc_server");
+        assert_eq!(jrpc.listen_address, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(jrpc.max_concurrent_requests, 32);
+        let written = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(written["jrpc_server"]["listen_address"], "127.0.0.1:8081");
+
+        // written back exactly as it was: no defaults added
+        assert_eq!(written["jrpc_server"], serde_json::json!({"listen_address": "127.0.0.1:8081"}));
+
+        // absent: off, and not written
+        let config: TonNodeConfig = serde_json::from_str("{}").expect("empty config");
+        assert!(config.jrpc_server().is_none());
+        assert!(serde_json::to_value(&config).expect("serialize").get("jrpc_server").is_none());
+
+        // a section the node cannot use (a host name, not an IP): JRPC is off, the config
+        // still reads - the node starts - and the section is written back untouched
+        for bad in [r#"{"listen_address": "localhost:8081"}"#, r#"{"port": 8081}"#, r#""127.0.0.1:8081""#] {
+            let text = format!(r#"{{"jrpc_server": {}}}"#, bad);
+            let config: TonNodeConfig = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{} must not stop the node: {}", bad, e));
+            assert!(config.jrpc_server().is_none(), "{}", bad);
+            let written = serde_json::to_value(&config).expect("serialize");
+            assert_eq!(written["jrpc_server"], serde_json::from_str::<serde_json::Value>(bad).unwrap());
+        }
+    }
+
+    #[test]
+    fn the_example_config_switches_the_jrpc_server_on() {
+        // configs/default_config.json is what a new node generates its config.json from at
+        // the first start. The server is in it - on a loopback address, without history
+        // (that takes a list of accounts) - and the generated config.json keeps the section
+        let dir = std::env::temp_dir().join(format!("jrpc-example-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::copy("configs/default_config.json", dir.join("default_config.json")).expect("the example config");
+        let config = TonNodeConfig::from_file(dir.to_str().unwrap(), "config.json", None, "default_config.json", None)
+            .expect("a config.json generated from the example");
+        let jrpc = config.jrpc_server().expect("a jrpc_server section the node can use");
+        assert_eq!(jrpc.listen_address, "127.0.0.1:8081".parse().unwrap());
+        assert!(crate::network::jrpc::is_private_listen_address(&jrpc.listen_address.ip()));
+        assert!(jrpc.history.is_none());
+        let written = std::fs::read_to_string(dir.join("config.json")).expect("the generated config.json");
+        let written: serde_json::Value = serde_json::from_str(&written).expect("json");
+        assert_eq!(written["jrpc_server"], serde_json::json!({"listen_address": "127.0.0.1:8081"}));
+        std::fs::remove_dir_all(dir).ok();
     }
 }

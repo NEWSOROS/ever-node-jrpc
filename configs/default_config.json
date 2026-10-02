@@ -4,6 +4,9 @@
   "internal_db_path": "node_db",
   "ip_address": "0.0.0.0:30303",
   "control_server_port": 3031,
+  "jrpc_server": {
+    "listen_address": "127.0.0.1:8081"
+  },
   "validation_countdown_mode": null,
   "unsafe_catchain_patches_path": null,
   "validator_keys": null,

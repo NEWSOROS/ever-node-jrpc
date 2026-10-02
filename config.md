@@ -67,3 +67,41 @@ Enables participation in validator REMP protocols. Default value is `true`.
 
 * `smft_disabled`: manually disables participation of the node in SMFT protocol even if corresponding network config is set; false by default
 
+`jrpc_server` section
+------------
+
+In-process JSON-RPC API (`src/network/jrpc.rs`): the "simple" API of broxus/everscale-jrpc
+(getContractState, sendMessage, getLatestKeyBlock, getBlockchainConfig, getTimings,
+getStatus, getCapabilities, getLibraryCell), served from the node's latest state over
+HTTP POST on `/` or `/rpc`. Absent - off. The methods and the answers are in [JRPC.md](JRPC.md).
+The example config `configs/default_config.json` has the section with `127.0.0.1:8081`.
+
+* `listen_address`: `IP:port`, e.g. `"127.0.0.1:8081"`. Only a loopback or private address
+  (127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 100.64.0.0/10, ::1, fc00::/7) is accepted: the
+  API has no authorization and runs in the node process.
+* `max_concurrent_requests`: default `32`.
+* `history`: transaction history (getTransactionsList, getTransaction, getDstTransaction,
+  getHistoryStatus) of ONLY the listed accounts, indexed as blocks are applied
+  (`src/network/jrpc_history.rs`):
+  * `accounts_file`: one `wc:hex` address per line, `#` comments; re-read when it changes.
+  * `db_path`: the index directory; default `<internal db>/jrpc_history`. Better outside the
+    node's database, so a resync of the node does not wipe the history: the indexer then
+    continues after a recorded gap.
+  * `start_from_mc_seqno`: while the index is empty, index from this masterchain block - a
+    backfill of what the node still stores. It needs the block before that one too; when
+    the node no longer has it, history starts right after the oldest block the node stores.
+    `0` or a block the node has not applied yet: ignored. Default: from the last applied
+    block on.
+  * `catch_up_mc_blocks_per_sec`: default `10` - masterchain blocks per second at most
+    while catching up (a backfill, or after the node was down). Above `1000`: no limit.
+  * `start_delay_sec`: default `600` - the indexer does nothing for this long after every
+    start of the node, then catches up. Where history starts is fixed at boot, so nothing
+    is skipped.
+
+  An unreadable accounts file or index turns the history off with `JRPC history is off: ...`
+  in the log; the node and the rest of the API run as usual.
+
+  A section the node cannot use (a host name instead of an IP, a public address, a taken
+  port, a `history` subsection that does not parse) turns the API off with the log line
+  `JRPC server is off: ...`; the node starts and runs as usual, and the section is written
+  back to the config unchanged. What is off stays off until the node is started again.

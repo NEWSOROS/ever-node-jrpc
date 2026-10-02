@@ -535,6 +535,9 @@ impl Stopper {
         if bitmap & Engine::MASK_SERVICE_ARCHIVES_GC != 0 {
             ss.push_str("archives gc, ");
         }
+        if bitmap & Engine::MASK_SERVICE_JRPC_HISTORY != 0 {
+            ss.push_str("JRPC history indexer, ");
+        }
         #[cfg(feature = "external_db")]
         if bitmap & Engine::MASK_SERVICE_EXTERNAL_DB != 0 {
             ss.push_str("external db, ");
@@ -577,6 +580,7 @@ impl Engine {
     pub const MASK_SERVICE_DB_RESTORE: u32                     = 0x0400;
     pub const MASK_SERVICE_ARCHIVES_GC: u32                    = 0x0800;
     pub const MASK_SERVICE_SS_CACHE_KEEPER: u32                = 0x1000;
+    pub const MASK_SERVICE_JRPC_HISTORY: u32                   = 0x4000;
     #[cfg(feature = "external_db")]
     pub const MASK_SERVICE_EXTERNAL_DB: u32                    = 0x2000;
 
@@ -2767,6 +2771,7 @@ pub async fn run(
     #[cfg(feature = "external_db")]
     let consumer_config = node_config.kafka_consumer_config();
     let control_server_config = node_config.control_server()?;
+    let jrpc_server_config = node_config.jrpc_server();
     let remp_config = node_config.remp_config().clone();
     let vm_config = ValidatorManagerConfig::read_configs(
         node_config.unsafe_catchain_patches_files(),
@@ -2806,6 +2811,12 @@ pub async fn run(
                 ).await?
             );
             engine.register_server(server)
+        };
+
+        // In-process JSON-RPC API (off unless configured; never stops the node from starting)
+        let jrpc_history = match jrpc_server_config {
+            Some(config) => crate::network::jrpc::start(config, engine.clone() as Arc<dyn EngineOperations>),
+            None => None,
         };
 
         #[cfg(feature = "external_db")]
@@ -2873,6 +2884,11 @@ pub async fn run(
         }
 
         Engine::start_archives_gc(engine.clone(), boot_info.archives_gc_block)?;
+
+        // Transaction history of the accounts the JRPC server indexes (behind the shard client)
+        if let Some(history) = jrpc_history {
+            crate::network::jrpc_history::start_indexer(engine.clone() as Arc<dyn EngineOperations>, history);
+        }
 
         #[cfg(feature = "external_db")]
         let _ = start_external_db_worker(engine.clone(), boot_info.external_db_block)?;

@@ -17,6 +17,8 @@ pub mod neighbours;
 pub mod full_node_client;
 pub mod full_node_service;
 pub mod control;
+pub mod jrpc;
+pub mod jrpc_history;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod remp;

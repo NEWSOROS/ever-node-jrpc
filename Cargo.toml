@@ -84,6 +84,8 @@ stream-cancel = '0.8'
 string-builder = '0.2'
 thiserror = '1.0'
 tokio = { features = [ 'rt-multi-thread' ], version = '1.40' }
+hyper = { features = [ 'server', 'http1', 'http2', 'tcp', 'runtime' ], version = '0.14' }
+rocksdb = '0.22'
 tokio-util = '0.7'
 adnl = { features = [ 'client', 'node', 'server' ], git = 'https://github.com/everx-labs/ever-adnl.git', tag = '0.11.32' }
 catchain = { path = 'catchain' }
@@ -98,6 +100,7 @@ ton_api = { git = 'https://github.com/everx-labs/ever-tl.git', package = 'ton_ap
 validator_session = { path = 'validator-session' }
 
 [dev-dependencies]
+hyper = { features = [ 'client', 'http2', 'tcp' ], version = '0.14' }
 difference = '2.0'
 external-ip = '5.0'
 pretty_assertions = '1.3'
