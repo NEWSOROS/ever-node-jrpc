@@ -45,7 +45,8 @@ pub(crate) fn transaction(boc_b64: &str) -> Transaction {
     Transaction::construct_from_cell(boc_cell(boc_b64)).unwrap()
 }
 
-/// An index row as the indexer makes it, from a transaction BOC of the given workchain.
+/// An index row as the indexer makes it for a listed account, from a transaction BOC of
+/// the given workchain.
 pub(crate) fn row_from_boc(workchain: i8, boc_b64: &str) -> TxRow {
     let cell = boc_cell(boc_b64);
     let transaction = Transaction::construct_from_cell(cell.clone()).unwrap();
@@ -55,7 +56,14 @@ pub(crate) fn row_from_boc(workchain: i8, boc_b64: &str) -> TxRow {
         hash: cell.repr_hash(),
         in_msg_hash: transaction.in_msg_cell().map(|msg| msg.repr_hash()),
         boc: write_boc(&cell).unwrap(),
+        utime: transaction.now(),
+        listed: true,
     }
+}
+
+/// The same row for an account that is not listed.
+pub(crate) fn other_row_from_boc(workchain: i8, boc_b64: &str) -> TxRow {
+    TxRow { listed: false, ..row_from_boc(workchain, boc_b64) }
 }
 
 pub(crate) fn hashes(bocs: &[String]) -> Vec<UInt256> {
@@ -78,7 +86,7 @@ pub(crate) fn mc_id(seqno: u32) -> BlockIdExt {
 /// (5, workchain 0).
 pub(crate) fn golden_index(name: &str) -> (TxHistory, PathBuf) {
     let dir = temp_dir(name);
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     let mut rows: Vec<TxRow> = transactions("elector").iter().map(|boc| row_from_boc(-1, boc)).collect();
     rows.extend(transactions("wallet").iter().map(|boc| row_from_boc(0, boc)));
     index.commit(&rows, &mc_id(1), None).unwrap();
@@ -124,15 +132,57 @@ fn test_fixtures_are_consecutive_transactions_of_their_accounts() {
 
 #[test]
 fn test_history_config_defaults() {
-    // only the accounts file is required; the indexer waits 10 min after boot by default,
-    // so the node's startup (the validator sessions coming up) is exactly as without it
-    let config: HistoryConfig = serde_json::from_str(r#"{"accounts_file": "/a"}"#).unwrap();
+    // nothing is required: every account's transactions of the last 30 days, 8 GB of them
+    // at most, and no account kept for good. The indexer waits 10 min after boot by
+    // default, so the node's startup (the validator sessions coming up) is exactly as
+    // without it
+    let config: HistoryConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(config.accounts_file, None);
+    assert_eq!(config.other_accounts_days, 30);
+    assert_eq!(config.other_accounts_max_mb, 8192);
+    assert_eq!(config.retention(), Some(Retention { keep_sec: 30 * 86_400, max_bytes: 8192 << 20 }));
     assert_eq!(config.start_delay_sec, 600);
     assert_eq!(config.catch_up_mc_blocks_per_sec, 10);
     assert_eq!(config.start_from_mc_seqno, None);
     assert_eq!(config.db_path, None);
-    let tuned: HistoryConfig = serde_json::from_str(r#"{"accounts_file": "/a", "start_delay_sec": 0}"#).unwrap();
-    assert_eq!(tuned.start_delay_sec, 0);
+    // a section written for the version before this one: the listed accounts, and now the
+    // other ones too
+    let listed: HistoryConfig = serde_json::from_str(r#"{"accounts_file": "/a", "start_delay_sec": 0}"#).unwrap();
+    assert_eq!(listed.accounts_file.as_deref(), Some("/a"));
+    assert_eq!(listed.start_delay_sec, 0);
+    assert_eq!(listed.other_accounts_days, 30);
+    // only the listed accounts, as that version indexed
+    let only: HistoryConfig = serde_json::from_str(r#"{"accounts_file": "/a", "other_accounts_days": 0}"#).unwrap();
+    assert_eq!(only.retention(), None);
+    // days and megabytes as written; 0 megabytes is no limit
+    let tuned: HistoryConfig =
+        serde_json::from_str(r#"{"other_accounts_days": 7, "other_accounts_max_mb": 0}"#).unwrap();
+    assert_eq!(tuned.retention(), Some(Retention { keep_sec: 7 * 86_400, max_bytes: u64::MAX }));
+    let small: HistoryConfig =
+        serde_json::from_str(r#"{"other_accounts_days": 1, "other_accounts_max_mb": 3}"#).unwrap();
+    assert_eq!(small.retention(), Some(Retention { keep_sec: 86_400, max_bytes: 3 * 1024 * 1024 }));
+}
+
+#[test]
+fn test_history_needs_something_to_index() {
+    let dir = temp_dir("nothing");
+    let root = dir.to_str().unwrap();
+    // neither listed accounts nor the other ones: the history stays off, with the reason
+    let nothing: HistoryConfig = serde_json::from_str(r#"{"other_accounts_days": 0}"#).unwrap();
+    let error = History::open(&nothing, root).err().expect("nothing to index").to_string();
+    assert!(error.contains("nothing to index"), "{}", error);
+    assert!(!dir.join("jrpc_history").exists(), "no index is made for it");
+    // an accounts file that cannot be read is an error whatever else is indexed
+    let missing: HistoryConfig = serde_json::from_str(r#"{"accounts_file": "/no/such/file"}"#).unwrap();
+    assert!(History::open(&missing, root).is_err());
+    // every account, none listed: the index is in the node's database directory
+    let all: HistoryConfig = serde_json::from_str("{}").unwrap();
+    let history = History::open(&all, root).unwrap();
+    assert_eq!(history.index.status().unwrap()["accounts"], 0);
+    assert_eq!(history.index.status().unwrap()["otherAccountsDays"], 30);
+    assert!(dir.join("jrpc_history").exists());
+    drop(history);
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -143,6 +193,10 @@ fn test_accounts_file_is_parsed_strictly() {
     assert_eq!(watched.in_workchain(-1), &[account(ELECTOR), account(CONFIG)]);
     assert_eq!(watched.in_workchain(0), &[account(WALLET)]);
     assert!(watched.in_workchain(5).is_empty());
+    // an account is listed in its workchain only
+    assert!(watched.contains(-1, &account(ELECTOR)) && watched.contains(0, &account(WALLET)));
+    assert!(!watched.contains(0, &account(ELECTOR)) && !watched.contains(-1, &account(WALLET)));
+    assert!(!Watched::default().contains(-1, &account(ELECTOR)));
 
     let bad = Watched::parse(&format!("{}\nnot an address\n", WALLET)).unwrap_err().to_string();
     assert!(bad.contains("line 2"), "{}", bad);
@@ -177,14 +231,15 @@ fn test_block_rows_take_only_the_watched_accounts() {
     let shard_block = block_with(&[&wallet[1], &wallet[0]]);
     let watched = Watched::parse(&format!("{}\n{}\n", ELECTOR, WALLET)).unwrap();
 
-    let rows = block_rows(&mc_block, -1, &watched).unwrap();
+    let rows = block_rows(&mc_block, -1, &watched, false).unwrap();
     let expected: Vec<TxRow> = [&elector[2], &elector[1], &elector[0]].iter().map(|boc| row_from_boc(-1, boc)).collect();
     assert_eq!(rows.len(), 3, "the config contract is not watched and stays out");
     for row in &expected {
         let found = rows.iter().find(|r| r.key == row.key).expect("watched transaction indexed");
-        assert_eq!(found.hash, row.hash);
-        assert_eq!(found.in_msg_hash, row.in_msg_hash);
+        assert_eq!(found, row, "hashes, the BOC, the transaction's own time, kept for good");
         assert_eq!(boc_cell(&ever_block::base64_encode(&found.boc)).repr_hash(), row.hash);
+        assert_eq!(found.utime, transaction(&ever_block::base64_encode(&found.boc)).now());
+        assert!(found.listed);
     }
     // the elector's newest transaction and its inbound message, as the chain names them
     let newest = rows.iter().find(|r| r.hash == boc_cell(&elector[0]).repr_hash()).unwrap();
@@ -195,17 +250,51 @@ fn test_block_rows_take_only_the_watched_accounts() {
     let tick_tock = rows.iter().find(|r| r.hash == boc_cell(&elector[1]).repr_hash()).unwrap();
     assert_eq!(tick_tock.in_msg_hash, None);
 
-    let rows = block_rows(&shard_block, 0, &watched).unwrap();
+    let rows = block_rows(&shard_block, 0, &watched, false).unwrap();
     assert_eq!(rows.len(), 2);
     let external = rows.iter().find(|r| r.hash == boc_cell(&wallet[1]).repr_hash()).unwrap();
     assert_eq!(external.in_msg_hash.as_ref().unwrap().to_hex_string(), WALLET_EXT_IN_MSG);
     assert_eq!(external.key[0], 0);
 
     // a block read as another workchain, or with nothing watched in it: nothing
-    assert!(block_rows(&mc_block, 0, &watched).unwrap().is_empty());
-    assert!(block_rows(&shard_block, -1, &watched).unwrap().is_empty());
-    assert!(block_rows(&mc_block, -1, &Watched::parse(WALLET).unwrap()).unwrap().is_empty());
-    assert!(block_rows(&mc_block, -1, &Watched::default()).unwrap().is_empty());
+    assert!(block_rows(&mc_block, 0, &watched, false).unwrap().is_empty());
+    assert!(block_rows(&shard_block, -1, &watched, false).unwrap().is_empty());
+    assert!(block_rows(&mc_block, -1, &Watched::parse(WALLET).unwrap(), false).unwrap().is_empty());
+    assert!(block_rows(&mc_block, -1, &Watched::default(), false).unwrap().is_empty());
+}
+
+#[test]
+fn test_block_rows_take_every_account_when_the_other_ones_are_indexed() {
+    let elector = transactions("elector");
+    let config = transactions("config");
+    let wallet = transactions("wallet");
+    let mc_block = block_with(&[&elector[2], &elector[1], &elector[0], &config[1], &config[0]]);
+    let shard_block = block_with(&[&wallet[1], &wallet[0]]);
+    let watched = Watched::parse(ELECTOR).unwrap();
+
+    // the elector is listed, the config contract is not: both are taken, each marked
+    let rows = block_rows(&mc_block, -1, &watched, true).unwrap();
+    assert_eq!(rows.len(), 5);
+    for boc in &elector[..3] {
+        assert!(rows.contains(&row_from_boc(-1, boc)), "the listed account's row, kept for good");
+    }
+    for boc in &config[..2] {
+        assert!(rows.contains(&other_row_from_boc(-1, boc)), "the other account's row, to be swept later");
+    }
+    // nobody is listed: every row is one to sweep
+    let rows = block_rows(&mc_block, -1, &Watched::default(), true).unwrap();
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|row| !row.listed));
+    // an account is listed in its own workchain: the wallet of workchain 0 is not the
+    // account with the same id in the masterchain
+    let rows = block_rows(&shard_block, 0, &watched, true).unwrap();
+    assert_eq!(rows, vec![other_row_from_boc(0, &wallet[1]), other_row_from_boc(0, &wallet[0])]);
+    let same_id_elsewhere = Watched::parse(&WALLET.replacen("0:", "-1:", 1)).unwrap();
+    assert!(block_rows(&shard_block, 0, &same_id_elsewhere, true).unwrap().iter().all(|row| !row.listed));
+    let rows = block_rows(&shard_block, 0, &Watched::parse(WALLET).unwrap(), true).unwrap();
+    assert!(rows.iter().all(|row| row.listed));
+    // a workchain id that does not fit a row key: nothing, as before
+    assert!(block_rows(&shard_block, 1000, &watched, true).unwrap().is_empty());
 }
 
 #[test]
@@ -215,7 +304,7 @@ fn test_block_rows_of_a_real_masterchain_block() {
     let text = std::fs::read_to_string("src/tests/static/jrpc/golden_keyblock.json").unwrap();
     let boc = serde_json::from_str::<serde_json::Value>(&text).unwrap()["result"]["block"].as_str().unwrap().to_string();
     let block = Block::construct_from_bytes(&base64_decode(&boc).unwrap()).unwrap();
-    let rows = block_rows(&block, -1, &Watched::parse(ELECTOR).unwrap()).unwrap();
+    let rows = block_rows(&block, -1, &Watched::parse(ELECTOR).unwrap(), false).unwrap();
     assert_eq!(rows.len(), 2, "the elector transacts twice in every masterchain block");
     for row in &rows {
         assert_eq!(row.key[0], 0xff, "masterchain rows carry workchain -1");
@@ -243,13 +332,34 @@ fn test_block_rows_of_a_real_masterchain_block() {
     assert!(index_finds(&rows, &consumed[0]));
 
     let unused = format!("-1:{}", "4".repeat(64));
-    assert!(block_rows(&block, -1, &Watched::parse(&unused).unwrap()).unwrap().is_empty());
+    assert!(block_rows(&block, -1, &Watched::parse(&unused).unwrap(), false).unwrap().is_empty());
+
+    // every account of the block: the elector's two rows are among them, the same rows but
+    // for the mark; each row is a transaction of the block, under its own account and lt
+    let all = block_rows(&block, -1, &Watched::default(), true).unwrap();
+    assert!(all.len() > rows.len(), "the elector is not the only account of a masterchain block");
+    for row in &rows {
+        assert!(all.contains(&TxRow { listed: false, ..row.clone() }));
+    }
+    let mut keys = HashSet::new();
+    for row in &all {
+        let cell = read_single_root_boc(&row.boc).unwrap();
+        let transaction = Transaction::construct_from_cell(cell.clone()).unwrap();
+        assert_eq!(cell.repr_hash(), row.hash);
+        assert_eq!(&row.key[1..33], transaction.account_id().get_bytestring(0).as_slice());
+        assert_eq!(key_lt(&row.key), transaction.logical_time());
+        assert_eq!(row.utime, transaction.now());
+        assert!(keys.insert(row.key), "each transaction once");
+    }
+    let listed = block_rows(&block, -1, &Watched::parse(ELECTOR).unwrap(), true).unwrap();
+    assert_eq!(listed.iter().filter(|row| row.listed).cloned().collect::<Vec<_>>(), rows);
+    assert_eq!(listed.len(), all.len());
 }
 
 /// The rows, committed to a fresh index, are found by that inbound message hash.
 fn index_finds(rows: &[TxRow], in_msg: &UInt256) -> bool {
     let dir = temp_dir("finds");
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     index.commit(rows, &mc_id(1), None).unwrap();
     let found = index.by_in_msg(in_msg).unwrap().is_some();
     drop(index);
@@ -306,13 +416,14 @@ fn test_list_is_newest_first_inclusive_and_pages_like_nekoton() {
 #[test]
 fn test_list_stays_inside_the_account() {
     let dir = temp_dir("boundary");
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     let a = UInt256::from([0x55; 32]);
     let mut b_bytes = [0x55; 32];
     b_bytes[31] = 0x56;
     let b = UInt256::from(b_bytes);
     let row = |workchain: i8, account: &UInt256, lt: u64| TxRow {
         key: tx_key(workchain, account, lt), hash: UInt256::from([lt as u8; 32]), in_msg_hash: None, boc: vec![lt as u8],
+        utime: 0, listed: true,
     };
     index.commit(&[row(0, &a, 10), row(0, &a, 20), row(0, &b, 5), row(0, &b, 30), row(-1, &a, 15)], &mc_id(1), None).unwrap();
     assert_eq!(index.list(0, &a, None, 10).unwrap(), vec![vec![20], vec![10]]);
@@ -353,7 +464,7 @@ fn test_lookups_by_hash_and_by_inbound_message() {
 fn test_commit_moves_the_marker_with_the_rows_and_survives_a_reopen() {
     let dir = temp_dir("reopen");
     {
-        let index = TxHistory::open(&dir).unwrap();
+        let index = TxHistory::open(&dir, None).unwrap();
         assert_eq!(index.last_mc_block().unwrap(), None);
         assert_eq!(index.smallest_known_lt(), u64::MAX, "empty: u64::MAX, as jrpc.everwallet.net");
         index.begin(&mc_id(99)).unwrap();
@@ -363,7 +474,7 @@ fn test_commit_moves_the_marker_with_the_rows_and_survives_a_reopen() {
         // the same block again (a restart before the marker moved): nothing doubles
         index.commit(&rows, &mc_id(100), None).unwrap();
     }
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     assert_eq!(index.last_mc_block().unwrap(), Some(mc_id(100)));
     assert_eq!(index.start_mc_seqno().unwrap(), Some(100));
     assert_eq!(index.list(0, &account(WALLET), None, 100).unwrap().len(), 5);
@@ -375,7 +486,7 @@ fn test_commit_moves_the_marker_with_the_rows_and_survives_a_reopen() {
 #[test]
 fn test_gaps_are_merged_and_reported() {
     let dir = temp_dir("gaps");
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     index.commit(&[], &mc_id(12), Some((10, 12))).unwrap();
     index.commit(&[], &mc_id(15), Some((13, 15))).unwrap();
     index.commit(&[], &mc_id(20), Some((20, 20))).unwrap();
@@ -393,7 +504,7 @@ fn test_gaps_are_merged_and_reported() {
 fn test_a_gap_is_committed_with_the_marker() {
     let dir = temp_dir("gap-commit");
     {
-        let index = TxHistory::open(&dir).unwrap();
+        let index = TxHistory::open(&dir, None).unwrap();
         index.begin(&mc_id(40)).unwrap();
         // the node no longer had blocks 41..=49: block 50's own transactions, the marker and
         // the gap (through 50 - its shard part is missing too) go in one write
@@ -407,7 +518,7 @@ fn test_a_gap_is_committed_with_the_marker() {
         // no gap: the record stays as it is
         index.commit(&[], &mc_id(61), None).unwrap();
     }
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     assert_eq!(index.gaps().unwrap(), vec![(41, 51), (60, 60)]);
     assert_eq!(index.last_mc_block().unwrap(), Some(mc_id(61)));
     assert_eq!(index.list(0, &account(WALLET), None, 100).unwrap().len(), 5);
@@ -417,6 +528,413 @@ fn test_a_gap_is_committed_with_the_marker() {
     assert_eq!(status["lastMcSeqno"], 61);
     assert_eq!(status["smallestKnownLt"], SMALLEST_LT.to_string());
     drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// ---- the accounts that are not listed ------------------------------------------------------
+
+const DAY: u32 = 86_400;
+/// When the made-up rows of these tests are made.
+const T: u32 = 1_790_000_000;
+
+/// Every account that is not listed is kept for so many days, without a size limit.
+fn kept_for(days: u32) -> Option<Retention> {
+    Some(Retention { keep_sec: u64::from(days) * 86_400, max_bytes: u64::MAX })
+}
+
+fn other_account(n: u8) -> UInt256 {
+    UInt256::from([n; 32])
+}
+
+/// A made-up row of workchain 0 of an account that is not listed: a transaction made at
+/// `utime`, of `size` bytes, started by a message of its own.
+fn other_row(account: &UInt256, lt: u64, utime: u32, size: usize) -> TxRow {
+    let mut hash = [account.as_slice()[0]; 32];
+    hash[..8].copy_from_slice(&lt.to_be_bytes());
+    let mut in_msg = hash;
+    in_msg[31] ^= 0xff;
+    TxRow {
+        key: tx_key(0, account, lt), hash: UInt256::from(hash), in_msg_hash: Some(UInt256::from(in_msg)),
+        boc: vec![lt as u8; size], utime, listed: false,
+    }
+}
+
+/// The lts of the account's made-up rows in the index, newest first.
+fn lts(index: &TxHistory, account: &UInt256) -> Vec<u8> {
+    index.list(0, account, None, 100).unwrap().iter().map(|boc| boc[0]).collect()
+}
+
+/// How many rows of accounts that are not listed the index says it has, and their bytes.
+fn others(index: &TxHistory) -> (u64, u64) {
+    let status = index.status().unwrap();
+    (status["otherTransactions"].as_u64().unwrap(), status["otherBytes"].as_u64().unwrap())
+}
+
+/// What is in the database: rows, their names by hash, their names by inbound message, and
+/// the records of the rows of the accounts that are not listed. A row that is swept must
+/// take all of its entries along - one that stayed would not be found by any lookup, and
+/// would stay for ever.
+fn entries(index: &TxHistory) -> (usize, usize, usize, usize) {
+    let count = |family: &str| {
+        index.db.iterator_cf(index.cf(family).unwrap(), rocksdb::IteratorMode::Start).map(|entry| entry.unwrap()).count()
+    };
+    let records = index.db.iterator(rocksdb::IteratorMode::Start)
+        .map(|entry| entry.unwrap()).filter(|(key, _)| key[0] == OTHER_PREFIX).count();
+    (count(CF_TRANSACTIONS), count(CF_BY_HASH), count(CF_BY_IN_MSG), records)
+}
+
+#[test]
+fn test_rows_of_other_accounts_are_stored_and_found_like_the_listed_ones() {
+    let dir = temp_dir("others");
+    let index = TxHistory::open(&dir, kept_for(30)).unwrap();
+    let (elector, wallet) = (transactions("elector"), transactions("wallet"));
+    // the elector is listed, the wallet is not; its shard block was walked twice (as after a
+    // split), so its rows come twice in one go
+    let wallet_rows: Vec<TxRow> = wallet.iter().map(|boc| other_row_from_boc(0, boc)).collect();
+    let mut rows: Vec<TxRow> = elector[..3].iter().map(|boc| row_from_boc(-1, boc)).collect();
+    rows.extend(wallet_rows.iter().chain(wallet_rows.iter()).cloned());
+    index.commit(&rows, &mc_id(1), None).unwrap();
+
+    let found: Vec<String> = index.list(0, &account(WALLET), None, 100).unwrap()
+        .iter().map(|boc| ever_block::base64_encode(boc)).collect();
+    assert_eq!(hashes(&found), hashes(&wallet));
+    let by_message = index.by_in_msg(&UInt256::from_str(WALLET_EXT_IN_MSG).unwrap()).unwrap().expect("by message");
+    assert_eq!(read_single_root_boc(&by_message).unwrap().repr_hash(), boc_cell(&wallet[1]).repr_hash());
+    let hash = boc_cell(&wallet[0]).repr_hash();
+    assert_eq!(read_single_root_boc(&index.by_hash(&hash).unwrap().expect("by hash")).unwrap().repr_hash(), hash);
+
+    // what the index has of the other accounts: the wallet's 5 rows, each once, and the bytes
+    // of their BOCs - the elector's rows are not among them
+    let bytes: u64 = wallet_rows.iter().map(|row| row.boc.len() as u64).sum();
+    assert_eq!(others(&index), (5, bytes));
+    assert_eq!(index.status().unwrap()["otherAccountsDays"], 30);
+    assert_eq!(index.smallest_known_lt(), SMALLEST_LT, "the wallet's oldest row is the oldest of all");
+    // the same block again (a restart before the marker moved): nothing doubles
+    index.commit(&rows, &mc_id(1), None).unwrap();
+    assert_eq!(others(&index), (5, bytes));
+    assert_eq!(index.list(0, &account(WALLET), None, 100).unwrap().len(), 5);
+    drop(index);
+
+    // the numbers are in the index: there after a restart, without its keys being read
+    let index = TxHistory::open(&dir, kept_for(30)).unwrap();
+    assert_eq!(others(&index), (5, bytes));
+    assert_eq!(index.smallest_known_lt(), SMALLEST_LT);
+    drop(index);
+    // an index that keeps no other accounts says so
+    let index = TxHistory::open(&dir, None).unwrap();
+    assert_eq!(index.status().unwrap()["otherAccountsDays"], Value::Null);
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_old_rows_of_other_accounts_are_swept() {
+    let dir = temp_dir("sweep");
+    let index = TxHistory::open(&dir, kept_for(10)).unwrap();
+    let (a, b, listed) = (other_account(0xa1), other_account(0xb2), other_account(0xc3));
+    let nobody = Watched::default();
+    // rows of two accounts that are not listed, and one of a listed account older than all
+    let rows = [
+        other_row(&a, 10, T, 100), other_row(&b, 15, T + 2 * DAY, 30),
+        other_row(&a, 20, T + DAY, 100), other_row(&a, 30, T + 5 * DAY, 100),
+        TxRow { listed: true, ..other_row(&listed, 5, T - 100 * DAY, 9) },
+    ];
+    index.commit(&rows, &mc_id(1), None).unwrap();
+    assert_eq!(others(&index), (4, 330));
+    assert_eq!(index.smallest_known_lt(), 5);
+    assert_eq!(entries(&index), (5, 5, 5, 4), "five rows, each with its two names; four of them to sweep");
+
+    // 10 days are kept: a row made exactly 10 days ago stays, a second later it goes
+    assert_eq!(index.sweep(T + 10 * DAY, &nobody).unwrap(), Swept::default());
+    assert_eq!(lts(&index, &a), vec![30, 20, 10]);
+    assert_eq!(index.sweep(T + 10 * DAY + 1, &nobody).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert_eq!(lts(&index, &a), vec![30, 20]);
+    // ... with what named it, and nothing else
+    assert!(index.by_hash(&rows[0].hash).unwrap().is_none());
+    assert!(index.by_in_msg(rows[0].in_msg_hash.as_ref().unwrap()).unwrap().is_none());
+    assert!(index.by_hash(&rows[2].hash).unwrap().is_some());
+    assert!(index.by_in_msg(rows[2].in_msg_hash.as_ref().unwrap()).unwrap().is_some());
+    assert_eq!(others(&index), (3, 230));
+    assert_eq!(entries(&index), (4, 4, 4, 3), "the row took its names and its record along");
+    assert_eq!(index.sweep(T + 10 * DAY + 1, &nobody).unwrap(), Swept::default(), "nothing more by then");
+
+    // two days on: the rows of both accounts made until then. The listed account's row, the
+    // oldest of all, is never swept
+    assert_eq!(index.sweep(T + 12 * DAY + 1, &nobody).unwrap(), Swept { dropped: 2, kept: 0 });
+    assert_eq!(lts(&index, &a), vec![30]);
+    assert!(lts(&index, &b).is_empty());
+    assert_eq!(lts(&index, &listed), vec![5]);
+    assert_eq!(others(&index), (1, 100));
+    assert_eq!(entries(&index), (2, 2, 2, 1));
+    assert_eq!(index.smallest_known_lt(), 5);
+    drop(index);
+
+    // after a restart the sweep goes on
+    let index = TxHistory::open(&dir, kept_for(10)).unwrap();
+    assert_eq!(others(&index), (1, 100));
+    assert_eq!(index.sweep(T + 15 * DAY, &nobody).unwrap(), Swept::default());
+    assert_eq!(index.sweep(T + 15 * DAY + 1, &nobody).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert_eq!(others(&index), (0, 0));
+    assert!(lts(&index, &a).is_empty());
+    assert_eq!(lts(&index, &listed), vec![5]);
+    assert_eq!(entries(&index), (1, 1, 1, 0), "the listed account's row and its names are all that is left");
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_rows_are_swept_in_the_order_of_their_lt() {
+    // the chain's lt and time grow together; rows are looked at in the order of their lt, and
+    // the first one that is not old ends the sweep
+    let dir = temp_dir("order");
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    let (a, b) = (other_account(0xa1), other_account(0xb2));
+    let nobody = Watched::default();
+    index.commit(&[other_row(&b, 20, T, 10), other_row(&a, 10, T, 10), other_row(&a, 30, T + 3 * DAY, 10)], &mc_id(1), None).unwrap();
+    assert_eq!(index.smallest_known_lt(), 10);
+    assert_eq!(index.sweep(T + 2 * DAY, &nobody).unwrap(), Swept { dropped: 2, kept: 0 });
+    assert_eq!((lts(&index, &a), lts(&index, &b)), (vec![30], vec![]));
+    assert_eq!(index.smallest_known_lt(), 30, "the oldest row that is left");
+    // a row with a greater lt made before it waits for it
+    index.commit(&[other_row(&b, 40, T, 10)], &mc_id(2), None).unwrap();
+    assert_eq!(index.sweep(T + 2 * DAY, &nobody).unwrap(), Swept::default());
+    assert_eq!(index.sweep(T + 4 * DAY + 1, &nobody).unwrap(), Swept { dropped: 2, kept: 0 });
+    assert_eq!(others(&index), (0, 0));
+    assert_eq!(index.smallest_known_lt(), u64::MAX, "no row, no lt");
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_the_size_limit_takes_the_oldest_rows_first() {
+    let dir = temp_dir("limit-bytes");
+    // rows of any age are kept - 250 bytes of them at most
+    let index = TxHistory::open(&dir, Some(Retention { keep_sec: 1000 * 86_400, max_bytes: 250 })).unwrap();
+    let a = other_account(0xa1);
+    let nobody = Watched::default();
+    let rows: Vec<TxRow> = (1..=5u64).map(|lt| other_row(&a, lt, T, 100)).collect();
+    index.commit(&rows[..2], &mc_id(1), None).unwrap();
+    assert_eq!(index.sweep(T, &nobody).unwrap(), Swept::default(), "200 bytes are within the limit");
+    index.commit(&rows[2..], &mc_id(2), None).unwrap();
+    assert_eq!(others(&index), (5, 500));
+    // 500 bytes: the oldest rows go until no more than 250 are left
+    assert_eq!(index.sweep(T, &nobody).unwrap(), Swept { dropped: 3, kept: 0 });
+    assert_eq!(lts(&index, &a), vec![5, 4]);
+    assert_eq!(others(&index), (2, 200));
+    assert_eq!(index.smallest_known_lt(), 4);
+    // exactly the limit is within it; one byte more is not
+    index.commit(&[other_row(&a, 6, T, 50)], &mc_id(3), None).unwrap();
+    assert_eq!(index.sweep(T, &nobody).unwrap(), Swept::default());
+    assert_eq!(others(&index), (3, 250));
+    index.commit(&[other_row(&a, 7, T, 1)], &mc_id(4), None).unwrap();
+    assert_eq!(index.sweep(T, &nobody).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert_eq!(lts(&index, &a), vec![7, 6, 5]);
+    assert_eq!(others(&index), (3, 151));
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_a_sweep_takes_a_bounded_number_of_rows() {
+    let dir = temp_dir("sweep-some");
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    let a = other_account(0xa1);
+    let nobody = Watched::default();
+    let rows: Vec<TxRow> = (1..=5u64).map(|lt| other_row(&a, lt, T, 10)).collect();
+    index.commit(&rows, &mc_id(1), None).unwrap();
+    // all five are old; two at a time, each sweep from where the one before it stopped
+    let now = T + 2 * DAY;
+    assert_eq!(index.sweep_rows(now, &nobody, 2).unwrap(), Swept { dropped: 2, kept: 0 });
+    assert_eq!(lts(&index, &a), vec![5, 4, 3]);
+    assert_eq!(others(&index), (3, 30));
+    assert_eq!(index.smallest_known_lt(), 3);
+    assert_eq!(index.sweep_rows(now, &nobody, 2).unwrap(), Swept { dropped: 2, kept: 0 });
+    assert_eq!(index.sweep_rows(now, &nobody, 2).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert_eq!(index.sweep_rows(now, &nobody, 2).unwrap(), Swept::default());
+    assert_eq!(others(&index), (0, 0));
+    assert!(lts(&index, &a).is_empty());
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_rows_of_an_account_listed_meanwhile_are_kept_for_good() {
+    let dir = temp_dir("listed-meanwhile");
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    let (a, b, c) = (other_account(0xa1), other_account(0xb2), other_account(0xc3));
+    let rows = [other_row(&a, 10, T, 10), other_row(&b, 15, T, 20), other_row(&a, 20, T, 10)];
+    index.commit(&rows, &mc_id(1), None).unwrap();
+    assert_eq!(others(&index), (3, 40));
+    // `a` was put on the list before its rows got old: they stay - `b`'s go
+    let with_a = Watched::parse(&format!("0:{}\n", a.to_hex_string())).unwrap();
+    assert_eq!(index.sweep(T + 2 * DAY, &with_a).unwrap(), Swept { dropped: 1, kept: 2 });
+    assert_eq!(lts(&index, &a), vec![20, 10]);
+    assert!(lts(&index, &b).is_empty());
+    assert!(index.by_hash(&rows[0].hash).unwrap().is_some());
+    assert!(index.by_in_msg(rows[2].in_msg_hash.as_ref().unwrap()).unwrap().is_some());
+    assert_eq!(others(&index), (0, 0), "they are a listed account's rows now");
+    assert_eq!(entries(&index), (2, 2, 2, 0), "with their names, and no record to sweep them by");
+    assert_eq!(index.smallest_known_lt(), 10);
+    // ... for good: whatever the list says later, and after a restart
+    assert_eq!(index.sweep(T + 100 * DAY, &Watched::default()).unwrap(), Swept::default());
+    drop(index);
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    assert_eq!(index.smallest_known_lt(), 10);
+    assert_eq!(index.sweep(T + 100 * DAY, &Watched::default()).unwrap(), Swept::default());
+    assert_eq!(lts(&index, &a), vec![20, 10]);
+
+    // the account with the same id in another workchain is another account
+    index.commit(&[other_row(&c, 40, T, 5)], &mc_id(2), None).unwrap();
+    let elsewhere = Watched::parse(&format!("-1:{}\n", c.to_hex_string())).unwrap();
+    assert_eq!(index.sweep(T + 2 * DAY, &elsewhere).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert!(lts(&index, &c).is_empty());
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_rows_of_other_accounts_go_when_they_are_not_indexed_any_more() {
+    let dir = temp_dir("off");
+    let (a, listed) = (other_account(0xa1), other_account(0xc3));
+    {
+        let index = TxHistory::open(&dir, kept_for(30)).unwrap();
+        let rows = [
+            other_row(&a, 10, T, 10), other_row(&a, 20, T + DAY, 10),
+            TxRow { listed: true, ..other_row(&listed, 30, T, 10) },
+        ];
+        index.commit(&rows, &mc_id(1), None).unwrap();
+        assert_eq!(index.sweep(T + DAY, &Watched::default()).unwrap(), Swept::default());
+    }
+    // other_accounts_days was set to 0: their rows are not wanted, whatever their age - not
+    // even one made after the block the sweep counts from
+    let index = TxHistory::open(&dir, None).unwrap();
+    assert_eq!(others(&index), (2, 20));
+    assert_eq!(index.smallest_known_lt(), 10);
+    assert_eq!(index.sweep(T, &Watched::default()).unwrap(), Swept { dropped: 2, kept: 0 });
+    assert!(lts(&index, &a).is_empty());
+    assert_eq!(lts(&index, &listed), vec![30]);
+    assert_eq!(others(&index), (0, 0));
+    assert_eq!(entries(&index), (1, 1, 1, 0));
+    // the smallest lt is the listed account's now: what was read at the start told the two
+    // kinds of rows apart
+    assert_eq!(index.smallest_known_lt(), 30);
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_a_swept_row_takes_only_its_own_names_along() {
+    // an account can take the same external message twice: the message names the later
+    // transaction, and still does when the earlier one is swept
+    let dir = temp_dir("twice");
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    let a = other_account(0xa1);
+    let first = other_row(&a, 10, T, 10);
+    let second = TxRow { in_msg_hash: first.in_msg_hash.clone(), ..other_row(&a, 20, T + 5 * DAY, 10) };
+    index.commit(&[first.clone()], &mc_id(1), None).unwrap();
+    index.commit(&[second.clone()], &mc_id(2), None).unwrap();
+    let message = first.in_msg_hash.clone().unwrap();
+    assert_eq!(index.by_in_msg(&message).unwrap(), Some(second.boc.clone()));
+    assert_eq!(entries(&index), (2, 2, 1, 2), "two rows under one message");
+    assert_eq!(index.sweep(T + 2 * DAY, &Watched::default()).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert_eq!(index.by_in_msg(&message).unwrap(), Some(second.boc.clone()));
+    assert!(index.by_hash(&first.hash).unwrap().is_none());
+    assert!(index.by_hash(&second.hash).unwrap().is_some());
+    assert_eq!(entries(&index), (1, 1, 1, 1));
+    // the later one, when its time comes, takes the name along
+    assert_eq!(index.sweep(T + 7 * DAY, &Watched::default()).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert!(index.by_in_msg(&message).unwrap().is_none());
+    assert_eq!(entries(&index), (0, 0, 0, 0), "nothing is left behind");
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_a_row_older_than_the_swept_ones_is_not_forgotten() {
+    let dir = temp_dir("late");
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    let a = other_account(0xa1);
+    let nobody = Watched::default();
+    let start = vec![OTHER_PREFIX];
+    assert_eq!(*index.sweep_from.lock().unwrap(), start);
+    index.commit(&[other_row(&a, 10, T, 10), other_row(&a, 30, T, 10)], &mc_id(1), None).unwrap();
+    assert_eq!(index.sweep(T + 2 * DAY, &nobody).unwrap(), Swept { dropped: 2, kept: 0 });
+    // the next sweep seeks past the records this one deleted instead of through them
+    let swept_to = OtherRow::record_key(&tx_key(0, &a, 30)).to_vec();
+    assert_eq!(*index.sweep_from.lock().unwrap(), swept_to);
+    // a row after that place leaves it where it is
+    index.commit(&[other_row(&a, 40, T + 5 * DAY, 10)], &mc_id(2), None).unwrap();
+    assert_eq!(*index.sweep_from.lock().unwrap(), swept_to);
+    // a shard block that comes with a later masterchain block can hold a transaction with a
+    // smaller lt than rows swept already: its record is before that place - the sweeps
+    // start over, or it would stay for ever
+    index.commit(&[other_row(&a, 20, T, 10)], &mc_id(3), None).unwrap();
+    assert_eq!(*index.sweep_from.lock().unwrap(), start);
+    assert_eq!(index.smallest_known_lt(), 20);
+    assert_eq!(index.sweep(T + 2 * DAY, &nobody).unwrap(), Swept { dropped: 1, kept: 0 });
+    assert_eq!(lts(&index, &a), vec![40]);
+    assert_eq!(others(&index), (1, 10));
+    assert_eq!(index.smallest_known_lt(), 40);
+    drop(index);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_an_index_made_before_other_accounts_were_indexed_opens_as_it_is() {
+    let dir = temp_dir("before");
+    {
+        let index = TxHistory::open(&dir, None).unwrap();
+        let mut rows: Vec<TxRow> = transactions("elector").iter().map(|boc| row_from_boc(-1, boc)).collect();
+        rows.extend(transactions("wallet").iter().map(|boc| row_from_boc(0, boc)));
+        index.commit(&rows, &mc_id(7), None).unwrap();
+        // what the version before this one did not write
+        for name in [META_LISTED_SMALLEST_LT, META_OTHER_COUNT, META_OTHER_BYTES] {
+            index.db.delete(name).unwrap();
+        }
+    }
+    // its rows are all listed accounts' rows: the smallest lt is found by reading their keys
+    // through, once; nothing is there to sweep
+    let index = TxHistory::open(&dir, kept_for(30)).unwrap();
+    assert_eq!(index.smallest_known_lt(), SMALLEST_LT);
+    assert_eq!(index.last_mc_block().unwrap(), Some(mc_id(7)));
+    assert_eq!(others(&index), (0, 0));
+    assert_eq!(index.sweep(u32::MAX, &Watched::default()).unwrap(), Swept::default());
+    assert_eq!(index.list(-1, &account(ELECTOR), None, 100).unwrap().len(), 100);
+    index.commit(&[other_row(&other_account(0xa1), u64::MAX - 1, T, 10)], &mc_id(8), None).unwrap();
+    drop(index);
+    // from the first write on that lt is in the index: the keys are not read again
+    let index = TxHistory::open(&dir, kept_for(30)).unwrap();
+    assert_eq!(index.number(META_LISTED_SMALLEST_LT).unwrap(), Some(SMALLEST_LT));
+    assert_eq!(index.smallest_known_lt(), SMALLEST_LT);
+    assert_eq!(others(&index), (1, 10));
+    drop(index);
+    // and the way back: the database keeps the layout that version opens - the same column
+    // families, the records of the other accounts' rows next to the marker
+    let mut families = DB::list_cf(&Options::default(), &dir).unwrap();
+    families.sort();
+    assert_eq!(families, ["default", "transactions", "transactions_by_hash", "transactions_by_in_msg"]);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_a_damaged_record_is_an_error_not_a_guess() {
+    let dir = temp_dir("damaged");
+    let index = TxHistory::open(&dir, kept_for(1)).unwrap();
+    index.commit(&[other_row(&other_account(0xa1), 10, T, 10)], &mc_id(1), None).unwrap();
+    // a record with a value that is none: too short, or of a length no record has
+    let record = OtherRow::record_key(&tx_key(0, &other_account(0xa1), 5));
+    for value in [vec![b'?'], vec![0u8; 41], vec![0u8; 73]] {
+        index.db.put(record, &value).unwrap();
+        let error = index.sweep(T + 2 * DAY, &Watched::default()).unwrap_err().to_string();
+        assert!(error.contains("bad record"), "{} bytes: {}", value.len(), error);
+        assert_eq!(others(&index), (1, 10), "nothing was taken off on the way");
+        assert_eq!(lts(&index, &other_account(0xa1)), vec![10]);
+    }
+    // a record with a key that is none: the index does not open as if nothing was wrong
+    index.db.put([OTHER_PREFIX, 0], b"?").unwrap();
+    drop(index);
+    let error = TxHistory::open(&dir, kept_for(1)).err().expect("a damaged index").to_string();
+    assert!(error.contains("bad record"), "{}", error);
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -586,17 +1104,26 @@ impl FakeChain {
         self.handle(&mc_id(seqno))
     }
 
-    /// An indexer of the elector and the wallet on this node, with its index in a fresh
-    /// directory.
+    /// An indexer of the elector and the wallet on this node - of the listed accounts
+    /// only - with its index in a fresh directory.
     fn indexer(self: &Arc<Self>, name: &str, start_from_mc_seqno: Option<u32>) -> (Indexer, PathBuf) {
+        self.indexer_of(name, start_from_mc_seqno, &[ELECTOR, WALLET], 0)
+    }
+
+    /// An indexer that keeps the `listed` accounts for good and, with `other_days` above
+    /// 0, every other account for that many days.
+    fn indexer_of(
+        self: &Arc<Self>, name: &str, start_from_mc_seqno: Option<u32>, listed: &[&str], other_days: u32
+    ) -> (Indexer, PathBuf) {
         let dir = temp_dir(name);
         let accounts_file = dir.join("accounts.txt");
-        std::fs::write(&accounts_file, format!("{}\n{}\n", ELECTOR, WALLET)).unwrap();
+        std::fs::write(&accounts_file, listed.iter().map(|address| format!("{}\n", address)).collect::<String>()).unwrap();
         let config = HistoryConfig {
-            accounts_file: accounts_file.to_str().unwrap().to_string(), db_path: None, start_from_mc_seqno,
+            accounts_file: Some(accounts_file.to_str().unwrap().to_string()), db_path: None, start_from_mc_seqno,
             catch_up_mc_blocks_per_sec: 10, start_delay_sec: 0,
+            other_accounts_days: other_days, other_accounts_max_mb: 0,
         };
-        let index = Arc::new(TxHistory::open(&dir.join("index")).unwrap());
+        let index = Arc::new(TxHistory::open(&dir.join("index"), config.retention()).unwrap());
         (Indexer { engine: self.clone() as Arc<dyn EngineOperations>, index, config }, dir)
     }
 }
@@ -613,6 +1140,11 @@ fn one_transaction(transaction_boc: &str) -> BlockExtra {
 /// A masterchain block generated NOW that holds one transaction. `shard_top`: the top block
 /// of workchain 0 (one shard) it refers to; None - a masterchain without shards.
 fn mc_block(seqno: u32, transaction_boc: &str, shard_top: Option<&BlockIdExt>) -> BlockStuff {
+    mc_block_at(seqno, transaction_boc, shard_top, NOW)
+}
+
+/// The same block, generated at `utime`.
+fn mc_block_at(seqno: u32, transaction_boc: &str, shard_top: Option<&BlockIdExt>, utime: u32) -> BlockStuff {
     let mut custom = McBlockExtra::default();
     if let Some(top) = shard_top {
         let descr = ShardDescr {
@@ -626,7 +1158,7 @@ fn mc_block(seqno: u32, transaction_boc: &str, shard_top: Option<&BlockIdExt>) -
     let mut info = BlockInfo::default();
     info.set_shard(ShardIdent::masterchain());
     info.set_seq_no(seqno).unwrap();
-    info.set_gen_utime(NOW.into());
+    info.set_gen_utime(utime.into());
     let block = Block::with_params(42, info, ValueFlow::default(), MerkleUpdate::default(), extra).unwrap();
     BlockStuff::fake_with_block(mc_id(seqno), block)
 }
@@ -769,6 +1301,134 @@ async fn test_indexer_follows_the_applied_blocks() {
     // blocks 41..=44 hold the elector's four newest transactions; block 40 is where it began
     assert_eq!(indexed(&indexer), hashes(&transactions("elector")[..4]));
     assert_eq!(indexer.index.gaps().unwrap(), vec![]);
+    drop(indexer);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn test_indexer_keeps_every_account_when_the_other_ones_are_indexed() {
+    // only the elector is listed: the wallet's transactions of the shard blocks are kept as
+    // an other account's, for 30 days
+    let node = chain_with_shard_blocks();
+    let (indexer, dir) = node.indexer_of("others", None, &[ELECTOR], 30);
+    indexer.index.begin(&mc_id(40)).unwrap();
+    indexer.run().await.unwrap();
+    assert_eq!(indexer.index.last_mc_block().unwrap(), Some(mc_id(43)));
+    assert_eq!(indexed_wallet(&indexer), hashes(&transactions("wallet")[..3]));
+    assert_eq!(indexed(&indexer), hashes(&transactions("elector")[..3]));
+    let status = indexer.index.status().unwrap();
+    assert_eq!(status["accounts"], 1, "{}", status);
+    assert_eq!(status["otherTransactions"], 3, "{}", status);
+    assert_eq!(status["otherAccountsDays"], 30);
+    drop(indexer);
+    std::fs::remove_dir_all(dir).ok();
+
+    // nobody is listed: every account is an other one - the elector too
+    let node = chain_with_shard_blocks();
+    let (indexer, dir) = node.indexer_of("nobody", None, &[], 30);
+    indexer.index.begin(&mc_id(40)).unwrap();
+    indexer.run().await.unwrap();
+    assert_eq!(indexed_wallet(&indexer).len(), 3);
+    assert_eq!(indexed(&indexer).len(), 3);
+    let status = indexer.index.status().unwrap();
+    assert_eq!((status["accounts"].as_u64(), status["otherTransactions"].as_u64()), (Some(0), Some(6)), "{}", status);
+    drop(indexer);
+    std::fs::remove_dir_all(dir).ok();
+
+    // ... and so it is without an accounts file at all
+    let node = chain_with_shard_blocks();
+    let (mut indexer, dir) = node.indexer_of("no-file", None, &[], 30);
+    indexer.config.accounts_file = None;
+    indexer.index.begin(&mc_id(40)).unwrap();
+    indexer.run().await.unwrap();
+    assert_eq!(indexer.index.last_mc_block().unwrap(), Some(mc_id(43)));
+    assert_eq!((indexed_wallet(&indexer).len(), indexed(&indexer).len()), (3, 3));
+    assert_eq!(indexer.index.status().unwrap()["accounts"], 0);
+    drop(indexer);
+    std::fs::remove_dir_all(dir).ok();
+
+    // the other accounts are not indexed: the listed elector only, as before
+    let node = chain_with_shard_blocks();
+    let (indexer, dir) = node.indexer_of("listed-only", None, &[ELECTOR], 0);
+    indexer.index.begin(&mc_id(40)).unwrap();
+    indexer.run().await.unwrap();
+    assert!(indexed_wallet(&indexer).is_empty());
+    assert_eq!(indexed(&indexer), hashes(&transactions("elector")[..3]));
+    assert_eq!(indexer.index.status().unwrap()["otherTransactions"], 0);
+    // ... and nothing of the other accounts was stored on the way, to be swept at once: no
+    // sweep ever had a row to take
+    assert_eq!(*indexer.index.sweep_from.lock().unwrap(), vec![OTHER_PREFIX]);
+    drop(indexer);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// How many rows of the config contract the indexer's index has.
+fn indexed_config(indexer: &Indexer) -> Vec<UInt256> {
+    let bocs = indexer.index.list(-1, &account(CONFIG), None, 100).unwrap();
+    bocs.iter().map(|boc| read_single_root_boc(boc).unwrap().repr_hash()).collect()
+}
+
+#[tokio::test]
+async fn test_indexer_sweeps_by_the_time_of_the_chain() {
+    let (elector, config) = (transactions("elector"), transactions("config"));
+    // when the config contract's transactions of the fixtures were made
+    let (oldest, newest) = (transaction(&config[2]).now(), transaction(&config[1]).now());
+    assert!(oldest <= newest);
+    let node = FakeChain::new();
+    node.apply(mc_block_at(40, &elector[3], None, oldest));
+    node.apply(mc_block_at(41, &config[2], None, oldest));
+    // this block is generated exactly a day after the older one: not older than a day yet
+    node.apply(mc_block_at(42, &config[1], None, oldest + DAY));
+    // the elector is listed, every other account is kept for a day
+    let (indexer, dir) = node.indexer_of("chain-time", None, &[ELECTOR], 1);
+    indexer.index.begin(&mc_id(40)).unwrap();
+    indexer.run().await.unwrap();
+    assert_eq!(indexed_config(&indexer), hashes(&config[1..3]));
+
+    // a block generated more than a day after both: they are swept as it is stored - by
+    // the block's time, the node's clock says an earlier day. The listed elector's row of
+    // the same age stays
+    assert!(node.now() < oldest);
+    node.apply(mc_block_at(43, &elector[2], None, newest + DAY + 1));
+    node.stopping.store(false, Ordering::Relaxed);
+    indexer.run().await.unwrap();
+    assert_eq!(indexer.index.last_mc_block().unwrap(), Some(mc_id(43)));
+    assert!(indexed_config(&indexer).is_empty());
+    assert_eq!(indexed(&indexer), hashes(&[elector[2].clone()]));
+    assert_eq!(indexer.index.status().unwrap()["otherTransactions"], 0);
+    drop(indexer);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn test_indexer_keeps_what_it_has_of_an_account_put_on_the_list() {
+    let (elector, config) = (transactions("elector"), transactions("config"));
+    let made = transaction(&config[1]).now();
+    let node = FakeChain::new();
+    node.apply(mc_block_at(40, &elector[3], None, made));
+    node.apply(mc_block_at(41, &config[1], None, made));
+    let (indexer, dir) = node.indexer_of("listed-later", None, &[ELECTOR], 1);
+    indexer.index.begin(&mc_id(40)).unwrap();
+    indexer.run().await.unwrap();
+    assert_eq!(indexed_config(&indexer), hashes(&config[1..2]));
+    assert_eq!(indexer.index.status().unwrap()["otherTransactions"], 1);
+
+    // the config contract is put on the list while the index still has its row: when the
+    // row gets old it is not swept, and the next one is a listed account's from the start
+    std::fs::write(dir.join("accounts.txt"), format!("{}\n{}\n", ELECTOR, CONFIG)).unwrap();
+    node.apply(mc_block_at(42, &config[0], None, made + 2 * DAY));
+    node.stopping.store(false, Ordering::Relaxed);
+    indexer.run().await.unwrap();
+    assert_eq!(indexed_config(&indexer), hashes(&config[..2]));
+    let status = indexer.index.status().unwrap();
+    assert_eq!((status["accounts"].as_u64(), status["otherTransactions"].as_u64()), (Some(2), Some(0)), "{}", status);
+    // ... and off the list again it keeps them: they are a listed account's rows
+    std::fs::write(dir.join("accounts.txt"), format!("{}\n", ELECTOR)).unwrap();
+    node.apply(mc_block_at(43, &elector[2], None, made + 10 * DAY));
+    node.stopping.store(false, Ordering::Relaxed);
+    indexer.run().await.unwrap();
+    assert_eq!(indexer.index.last_mc_block().unwrap(), Some(mc_id(43)));
+    assert_eq!(indexed_config(&indexer), hashes(&config[..2]));
     drop(indexer);
     std::fs::remove_dir_all(dir).ok();
 }

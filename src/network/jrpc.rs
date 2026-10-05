@@ -63,7 +63,8 @@ pub struct JrpcServerConfig {
     pub listen_address: SocketAddr,
     #[serde(default = "JrpcServerConfig::default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
-    /// Transaction history of the accounts listed in a file (network/jrpc_history.rs).
+    /// Transaction history (network/jrpc_history.rs): the accounts listed in a file for
+    /// good, every other account for a number of days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryConfig>,
 }

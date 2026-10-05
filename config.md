@@ -81,9 +81,15 @@ The example config `configs/default_config.json` has the section with `127.0.0.1
   API has no authorization and runs in the node process.
 * `max_concurrent_requests`: default `32`.
 * `history`: transaction history (getTransactionsList, getTransaction, getDstTransaction,
-  getHistoryStatus) of ONLY the listed accounts, indexed as blocks are applied
-  (`src/network/jrpc_history.rs`):
-  * `accounts_file`: one `wc:hex` address per line, `#` comments; re-read when it changes.
+  getHistoryStatus), indexed as blocks are applied (`src/network/jrpc_history.rs`): the
+  listed accounts are kept for good, every other account for a number of days. Every key
+  is optional - `"history": {}` keeps every account for 30 days:
+  * `accounts_file`: the accounts kept for good, one `wc:hex` address per line, `#`
+    comments; re-read when it changes. Without it no account is kept for good.
+  * `other_accounts_days`: default `30` - days the transactions of every other account are
+    kept. `0`: only the listed accounts are indexed.
+  * `other_accounts_max_mb`: default `8192` - megabytes of transactions kept for the other
+    accounts at most; beyond that the oldest go first. `0`: no limit.
   * `db_path`: the index directory; default `<internal db>/jrpc_history`. Better outside the
     node's database, so a resync of the node does not wipe the history: the indexer then
     continues after a recorded gap.
@@ -98,8 +104,9 @@ The example config `configs/default_config.json` has the section with `127.0.0.1
     start of the node, then catches up. Where history starts is fixed at boot, so nothing
     is skipped.
 
-  An unreadable accounts file or index turns the history off with `JRPC history is off: ...`
-  in the log; the node and the rest of the API run as usual.
+  An unreadable accounts file or index, or nothing to index (no file and
+  `other_accounts_days` 0), turns the history off with `JRPC history is off: ...` in the
+  log; the node and the rest of the API run as usual.
 
   A section the node cannot use (a host name instead of an IP, a public address, a taken
   port, a `history` subsection that does not parse) turns the API off with the log line

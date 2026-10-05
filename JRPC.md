@@ -16,8 +16,9 @@ itself - no GraphQL stack, no separate indexer, no third-party endpoint.
 
 * The state methods are served from what the node keeps anyway: nothing is indexed and
   nothing is copied. everscale-jrpc calls this set its "simple" API.
-* The transaction history is opt-in and covers only the accounts you list in a file: a
-  RocksDB index of their transactions, not an index of the whole chain.
+* The transaction history is opt-in: a RocksDB index of the node's own. The accounts you
+  list in a file are kept for good; every other account is kept for a number of days (30
+  by default) - what a wallet needs to work with any address, not an archive of the chain.
 * It is off unless the node config has a `jrpc_server` section, and it cannot keep the
   node from starting: a section the node cannot use, a taken port or an unreadable
   accounts file is logged, the server (or the history) stays off until the node is
@@ -47,8 +48,21 @@ curl -s -H 'Content-Type: application/json' \
 
 It answers `{"ready": false}` while it synchronizes and `{"ready": true}` afterwards. The
 node's log says `JRPC server listening on 127.0.0.1:8081` - or `JRPC server is off: ...`
-with the reason. The transaction history takes a `history` subsection and a file with the
-accounts: see [Configuration](#configuration).
+with the reason.
+
+A wallet also asks for transactions. For that add a `history` subsection - empty, it keeps
+every account's transactions of the last 30 days, from the moment the node is started with
+it:
+
+```json
+"jrpc_server": {
+    "listen_address": "127.0.0.1:8081",
+    "history": {}
+}
+```
+
+The accounts whose history must never be dropped go into a file: see
+[Configuration](#configuration).
 
 ## Methods
 
@@ -73,7 +87,7 @@ With a `history` section also:
 | `getTransactionsList` | `account`, `limit`, optional `lastTransactionLt` | transaction BOCs, newest first, with lt <= `lastTransactionLt`; at most 100 |
 | `getTransaction` | `id`: transaction hash | the transaction BOC or `null` |
 | `getDstTransaction` | `messageHash` | the BOC of the transaction that consumed this message, or `null` |
-| `getHistoryStatus` | - | `accounts`, `startMcSeqno`, `lastMcSeqno`, `gaps`, `transactions`, `smallestKnownLt` |
+| `getHistoryStatus` | - | `accounts`, `startMcSeqno`, `lastMcSeqno`, `gaps`, `transactions`, `smallestKnownLt`, `otherAccountsDays`, `otherTransactions`, `otherBytes` |
 
 BOCs are base64. Hashes are hex. An lt is accepted as a decimal string or as a number.
 One request per HTTP body: JSON-RPC batches are not taken (-32600). A JSON-RPC error
@@ -99,11 +113,15 @@ Notes:
 * `sendMessage` hands the message to the node exactly like the console's `sendmessage`.
   `null` means "taken for broadcast", not "executed": follow the account state or
   `getDstTransaction` for the outcome.
-* `getTransactionsList` for an account that is not indexed answers `[]`, not an error.
+* `getTransactionsList` for an account the index has nothing of answers `[]`, not an
+  error.
 * `smallest_known_lt` is `null` without history; with it, the smallest lt in the index
   (`18446744073709551615` while the index is empty).
 * `getHistoryStatus` is not a method of everscale-jrpc, and `getCapabilities` does not
-  list it. `transactions` is RocksDB's estimate of the number of rows, not a count.
+  list it. `accounts` is the number of listed accounts. `transactions` is RocksDB's
+  estimate of the number of rows, not a count. `otherAccountsDays` is how long the accounts
+  that are not listed are kept (`null`: they are not indexed), `otherTransactions` and
+  `otherBytes` what the index has of them now - a count, and the bytes of their BOCs.
 
 ### Errors
 
@@ -128,8 +146,8 @@ does not arrive within 15 s - 408.
 ### Differences from everscale-jrpc
 
 * No `getAccountsByCodeHash`: that needs an index of every account.
-* History exists only for the listed accounts and only from the block where the index
-  was started (see below).
+* History is what the index holds: the listed accounts from the block where the index was
+  started, every other account for the last `other_accounts_days` (see below).
 * `getHistoryStatus` is an addition.
 * Only JSON-RPC over `POST`: no protobuf endpoint, `GET` and `OPTIONS` are refused and no
   CORS headers are sent, so a web page cannot call the server from a browser.
@@ -149,6 +167,8 @@ The example config `configs/default_config.json` has the shortest one - only
     "max_concurrent_requests": 32,
     "history": {
         "accounts_file": "/var/ever-node/jrpc-history-accounts.txt",
+        "other_accounts_days": 30,
+        "other_accounts_max_mb": 8192,
         "db_path": "/var/ever-node/jrpc_history"
     }
 }
@@ -156,9 +176,18 @@ The example config `configs/default_config.json` has the shortest one - only
 
 * `listen_address` - `IP:port`. Required.
 * `max_concurrent_requests` - default 32. Further requests wait up to 10 s for a slot.
-* `history` - optional:
-  * `accounts_file` - one `wc:hex` address per line, `#` starts a comment. The file is
-    re-read when it changes (checked every 10 s); an added account is indexed from then on.
+* `history` - optional; every key in it is optional too:
+  * `accounts_file` - the accounts whose history is kept for good: one `wc:hex` address
+    per line, `#` starts a comment. The file is re-read when it changes (checked every
+    10 s); an added account is kept from then on, with what the index still has of it.
+    Without a file no account is kept for good.
+  * `other_accounts_days` - default 30: for how many days the transactions of every other
+    account are kept. `0`: only the listed accounts are indexed, and what the index has
+    of other accounts is swept away.
+  * `other_accounts_max_mb` - default 8192: the most megabytes of transactions kept for
+    the other accounts (their BOCs; the database adds its own overhead on disk). Beyond
+    that the oldest go first, whatever their age: this is what bounds the index when the
+    chain gets busy. `0`: no limit.
   * `db_path` - the index directory; default `<node db>/jrpc_history`. Keeping it outside
     the node's database lets the history survive a resync of the node (the indexer then
     continues after a recorded gap).
@@ -176,16 +205,39 @@ The example config `configs/default_config.json` has the shortest one - only
 
 What cannot start stays off until the node is started again: the server when its address
 is not on an interface yet or the port is taken, the history when the accounts file cannot
-be read. A `history` subsection that does not parse turns the whole server off. When only
-the server cannot start, the history is still indexed - it is there after the next start.
+be read or when it is told to index nothing (no file and `other_accounts_days` 0). A
+`history` subsection that does not parse turns the whole server off. When only the server
+cannot start, the history is still indexed - it is there after the next start.
 
 ### History, precisely
 
 The indexer follows applied masterchain blocks. For each one it takes the block itself and
-the shard blocks between it and the previous masterchain block, and stores the transactions
-of the listed accounts, the id of the processed masterchain block and - when something was
-missing - the gap, in one write: a restart resumes exactly there. It expects the node to
-apply the shard blocks of every workchain, as a node of the Everscale mainnet does.
+the shard blocks between it and the previous masterchain block, and stores their
+transactions, the id of the processed masterchain block and - when something was missing -
+the gap, in one write: a restart resumes exactly there. It expects the node to apply the
+shard blocks of every workchain, as a node of the Everscale mainnet does.
+
+A transaction of a listed account is kept for good. A transaction of any other account is
+kept until it is `other_accounts_days` old, and while the transactions of those accounts
+together are within `other_accounts_max_mb`: after each masterchain block the old ones are
+swept, with their lookups by hash and by message. The age is counted by the chain - from
+the time of the masterchain block being indexed, not from the node's clock.
+
+* History of the other accounts starts where the index, or this setting, was started and
+  fills up as the node runs: nothing is taken from older blocks.
+* A wallet whose address is not listed sees its recent transactions and the one it has
+  just sent, which is what it needs to work. What is older than the window is not there:
+  `getTransactionsList` ends earlier, `getTransaction` and `getDstTransaction` answer
+  `null`.
+* An account put on the list while the index still has transactions of it keeps them for
+  good from then on. Taken off the list, it keeps what was kept for good; its new
+  transactions are an other account's again.
+* Size: in October 2026 the accounts of Everscale mainnet made about 230 000 transactions
+  a day together, about 100 MB of BOCs - two thirds of them the system contracts' - so 30
+  days are about 3 GB of BOCs, and the database's overhead on top.
+* The index keeps its layout. One made when only the listed accounts were indexed opens as
+  it is, and an index with other accounts in it still opens with that version of the node
+  (which then leaves them where they are).
 
 A node keeps blocks only from its cold boot on, and its archive GC drops older ones. What
 the indexer can no longer read becomes a gap on record (`getHistoryStatus.gaps`, ranges of
@@ -197,9 +249,9 @@ indexer:
   (a resync with the index kept outside the database). A node that is merely behind its
   index - it restarted after a crash - is waited for instead.
 
-Transactions already indexed stay after the node drops their blocks. The index is never
-pruned: its size is what the listed accounts transact, and opening it reads through its
-keys once.
+Transactions in the index do not depend on the node's blocks: they stay after the node
+drops them. The listed accounts' part is never pruned - its size is what those accounts
+transact.
 
 ## Security
 
@@ -250,8 +302,9 @@ fixtures are real mainnet data; where they come from and how they are tied toget
 
 The indexer runs in the tests against a fake node - a table of applied masterchain and
 shard blocks, some of them marked as collected by the archive GC - which covers following
-the chain, the shard blocks a masterchain block adds, the start point, gaps, and where
-history continues when blocks are missing. What the tests do not reach is the code that
+the chain, the shard blocks a masterchain block adds, the start point, gaps, where history
+continues when blocks are missing, keeping every account and sweeping the old rows by the
+time of the chain. What the tests do not reach is the code that
 reads a real node: which state an answer is taken from (`EngineBackend`), and the node's
 own block storage behind the indexer.
 
@@ -259,11 +312,18 @@ own block storage behind the indexer.
 
 * The server and the history index have been running on Everscale mainnet since
   2026-09-24.
-* Reworked for this publication, and so not covered by that running time: how the indexer
-  continues when the node no longer stores blocks (after a resync of the node, or blocks
-  collected by the archive GC), the pace of catching up, and a gap going into the same
-  write as the marker. This part is tested against a fake node; it has not run on a live
-  one yet.
+* That running time is of the listed accounts' history. Added or reworked for this
+  publication, and so not covered by it: keeping every other account for a number of days
+  with the sweep of old rows, how the indexer continues when the node no longer stores
+  blocks (after a resync of the node, or blocks collected by the archive GC), the pace of
+  catching up, and a gap going into the same write as the marker. These parts are tested
+  against a fake node; they have not run on a live one yet. Keeping every account was also
+  run offline over real blocks: 400 consecutive masterchain blocks of mainnet with their
+  shard blocks, read from a node's block archive on 2026-10-05, gave 3280 transactions of
+  426 accounts - the same as counted by a separate program - stored, found and swept.
+* EVER Wallet (a nekoton wallet), with such a node added as a custom network of type JRPC,
+  sent a transfer on mainnet on 2026-10-02 from an account the node kept the history of,
+  saw it confirmed and showed it in its history.
 * This branch - upstream plus only this feature - builds and passes the tests. Its
   release binary was also started as a fresh node cut off from the network, from the
   example config (with `ip_address` set: a node told `0.0.0.0` asks the internet for its

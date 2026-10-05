@@ -537,10 +537,10 @@ fn test_start_serves_over_tcp_and_refuses_a_taken_port() {
 
 use crate::network::jrpc_history::{
     tests::{
-        golden_index, hashes, temp_dir, transactions, CONFIG, ELECTOR, ELECTOR_NEWEST_IN_MSG,
-        ELECTOR_NEWEST_LT, SMALLEST_LT, WALLET, WALLET_EXT_IN_MSG,
+        golden_index, hashes, mc_id, other_row_from_boc, temp_dir, transactions, CONFIG, ELECTOR,
+        ELECTOR_NEWEST_IN_MSG, ELECTOR_NEWEST_LT, SMALLEST_LT, WALLET, WALLET_EXT_IN_MSG,
     },
-    tx_key, TxHistory, TxRow,
+    tx_key, Retention, TxHistory, TxRow,
 };
 
 fn with_history(index: TxHistory) -> JrpcServer<FakeNode> {
@@ -617,6 +617,45 @@ fn test_history_methods() {
     let status = ask(&server, &call("getHistoryStatus", json!({})));
     assert_eq!(status["result"]["lastMcSeqno"], 1, "{}", status);
     assert_eq!(status["result"]["smallestKnownLt"], SMALLEST_LT.to_string());
+    // this index keeps the listed accounts only
+    assert_eq!(status["result"]["otherAccountsDays"], Value::Null, "{}", status);
+    assert_eq!(status["result"]["otherTransactions"], 0);
+    assert_eq!(status["result"]["otherBytes"], 0);
+
+    drop(server);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn test_history_of_an_account_that_is_not_listed() {
+    // the node keeps every account's transactions for a while: the answers are the same as
+    // for a listed account, and getHistoryStatus says how much there is of them
+    let dir = temp_dir("server-others");
+    let index = TxHistory::open(&dir, Some(Retention { keep_sec: 30 * 86_400, max_bytes: u64::MAX })).unwrap();
+    let wallet = transactions("wallet");
+    let rows: Vec<TxRow> = wallet.iter().map(|boc| other_row_from_boc(0, boc)).collect();
+    let bytes: usize = rows.iter().map(|row| row.boc.len()).sum();
+    index.commit(&rows, &mc_id(1), None).unwrap();
+    let server = with_history(index);
+
+    let all = ask(&server, &call("getTransactionsList", json!({"account": WALLET, "limit": 100})));
+    assert_eq!(hashes(&result_list(&all)), hashes(&wallet));
+    let answer = ask(&server, &call("getDstTransaction", json!({"messageHash": WALLET_EXT_IN_MSG})));
+    assert_eq!(hashes(&[answer["result"].as_str().unwrap().to_string()]), hashes(&[wallet[1].clone()]));
+    let newest = hashes(&[wallet[0].clone()])[0].to_hex_string();
+    let answer = ask(&server, &call("getTransaction", json!({"id": newest})));
+    assert_eq!(hashes(&[answer["result"].as_str().unwrap().to_string()]), hashes(&[wallet[0].clone()]));
+    // an account without transactions in that time: none, not an error
+    assert_eq!(ask(&server, &call("getTransactionsList", json!({"account": CONFIG, "limit": 5})))["result"], json!([]));
+
+    let status = ask(&server, &call("getHistoryStatus", json!({})))["result"].clone();
+    assert_eq!(status["accounts"], 0, "{}", status);
+    assert_eq!(status["otherAccountsDays"], 30, "{}", status);
+    assert_eq!(status["otherTransactions"], 5, "{}", status);
+    assert_eq!(status["otherBytes"], bytes, "{}", status);
+    assert_eq!(status["smallestKnownLt"], SMALLEST_LT.to_string());
+    let timings = ask(&server, &call("getTimings", Value::Null));
+    assert_eq!(timings["result"]["smallest_known_lt"], json!(SMALLEST_LT), "{}", timings);
 
     drop(server);
     std::fs::remove_dir_all(dir).ok();
@@ -626,12 +665,13 @@ fn test_history_methods() {
 fn test_limit_is_cut_to_100() {
     // as jrpc.everwallet.net did: a larger limit is not an error
     let dir = temp_dir("limit");
-    let index = TxHistory::open(&dir).unwrap();
+    let index = TxHistory::open(&dir, None).unwrap();
     let account = UInt256::from([0x42; 32]);
     let rows: Vec<TxRow> = (1..=105u64).map(|lt| TxRow {
         key: tx_key(0, &account, lt), hash: UInt256::from([lt as u8; 32]), in_msg_hash: None, boc: vec![lt as u8],
+        utime: 0, listed: true,
     }).collect();
-    index.commit(&rows, &crate::network::jrpc_history::tests::mc_id(1), None).unwrap();
+    index.commit(&rows, &mc_id(1), None).unwrap();
     let server = with_history(index);
     let address = format!("0:{}", "42".repeat(32));
     for limit in [101u64, 256, 1000] {

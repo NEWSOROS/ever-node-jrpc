@@ -1,15 +1,16 @@
 /*
 * Transaction history for the in-process JRPC server (network/jrpc.rs): getTransactionsList,
 * getTransaction and getDstTransaction of broxus/everscale-jrpc's "full" mode, answered from
-* an index of ONLY the accounts listed in a file (an operator's own wallets and contracts,
-* for example) - not of the whole chain.
+* an index of the node's own: the accounts listed in a file (an operator's own wallets and
+* contracts, for example) are kept for good, every other account for a number of days.
 *
 * The indexer follows applied masterchain blocks the way the external db worker does: for
 * each one it takes the masterchain block itself and the shard blocks between it and the
-* previous masterchain block (behind the shard client), keeps the transactions of the listed
-* accounts in its own RocksDB (<node db>/jrpc_history) and commits the id of the processed
-* masterchain block in the same write batch - a restart resumes exactly there, and
-* processing a block twice is harmless.
+* previous masterchain block (behind the shard client), keeps their transactions in its own
+* RocksDB (<node db>/jrpc_history) and commits the id of the processed masterchain block in
+* the same write batch - a restart resumes exactly there, and processing a block twice is
+* harmless. After each block the rows of the accounts that are not listed are swept: what is
+* older than `other_accounts_days`, and the oldest beyond `other_accounts_max_mb`, goes.
 *
 * The node keeps blocks only from its cold boot on, and archive GC drops older ones:
 * history starts where the index was enabled, or at `start_from_mc_seqno` when the node
@@ -24,8 +25,8 @@ use crate::{block::BlockStuff, engine::Engine, engine_traits::EngineOperations};
 use storage::block_handle_db::BlockHandle;
 
 use ever_block::{
-    error, fail, write_boc, Block, BlockIdExt, Deserializable, HashmapAugType, MsgAddressInt,
-    Result, ShardIdent, Transaction, UInt256,
+    error, fail, write_boc, AccountBlock, Block, BlockIdExt, Deserializable, HashmapAugType,
+    MsgAddressInt, Result, ShardIdent, Transaction, UInt256,
 };
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, ReadOptions, WriteBatch, DB};
 use serde_json::{json, Value};
@@ -34,7 +35,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc},
+    sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -47,6 +48,18 @@ const CF_BY_IN_MSG: &str = "transactions_by_in_msg";
 const META_LAST_MC_BLOCK: &[u8] = b"last_mc_block";
 const META_START_MC_SEQNO: &[u8] = b"start_mc_seqno";
 const META_GAPS: &[u8] = b"gaps";
+/// The smallest lt among the rows kept for good.
+const META_LISTED_SMALLEST_LT: &[u8] = b"listed_smallest_lt";
+/// The rows of the accounts that are not listed: how many, and the bytes of their BOCs.
+const META_OTHER_COUNT: &[u8] = b"other_count";
+const META_OTHER_BYTES: &[u8] = b"other_bytes";
+/// First byte of the keys that record those rows, next to the names above (the default
+/// column family: an index made by this version opens with the previous one, and back).
+const OTHER_PREFIX: u8 = 0;
+
+const DAY_SEC: u64 = 86_400;
+/// Most rows one sweep takes off; what is left waits for the next masterchain block.
+const SWEEP_MAX_ROWS: usize = 10_000;
 
 /// How often the accounts file is checked for changes.
 const ACCOUNTS_CHECK_PERIOD: Duration = Duration::from_secs(10);
@@ -60,9 +73,20 @@ const QUICK_FAILURE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct HistoryConfig {
-    /// The accounts to index, one "wc:hex" address per line ('#' starts a comment). The
-    /// file is re-read when it changes; an added account is indexed from then on.
-    pub accounts_file: String,
+    /// The accounts whose history is kept for good, one "wc:hex" address per line ('#'
+    /// starts a comment). The file is re-read when it changes; an added account is kept
+    /// from then on - with what the index still has of it. Without a file no account is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts_file: Option<String>,
+    /// Days the transactions of every other account are kept; 0 - only the listed accounts
+    /// are indexed.
+    #[serde(default = "HistoryConfig::default_other_accounts_days")]
+    pub other_accounts_days: u32,
+    /// Most megabytes of transactions kept for the other accounts (their BOCs, before the
+    /// database's own overhead): beyond that the oldest go first, whatever their age - what
+    /// bounds the index when the chain gets busy. 0 - no limit.
+    #[serde(default = "HistoryConfig::default_other_accounts_max_mb")]
+    pub other_accounts_max_mb: u32,
     /// Where the index lives; default <node db>/jrpc_history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_path: Option<String>,
@@ -84,6 +108,27 @@ pub struct HistoryConfig {
 impl HistoryConfig {
     fn default_catch_up_rate() -> u32 { 10 }
     fn default_start_delay() -> u32 { 600 }
+    fn default_other_accounts_days() -> u32 { 30 }
+    fn default_other_accounts_max_mb() -> u32 { 8192 }
+
+    /// How long the accounts that are not listed are kept; None - they are not indexed.
+    pub fn retention(&self) -> Option<Retention> {
+        (self.other_accounts_days > 0).then(|| Retention {
+            keep_sec: u64::from(self.other_accounts_days) * DAY_SEC,
+            max_bytes: match self.other_accounts_max_mb {
+                0 => u64::MAX,
+                megabytes => u64::from(megabytes) << 20,
+            },
+        })
+    }
+}
+
+/// What is kept of the accounts that are not listed: nothing older than `keep_sec`, and
+/// `max_bytes` of transactions at most.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Retention {
+    pub keep_sec: u64,
+    pub max_bytes: u64,
 }
 
 // ---- which accounts -------------------------------------------------------------------
@@ -97,16 +142,17 @@ pub fn std_address(text: &str) -> Result<(i32, UInt256)> {
     }
 }
 
-/// The accounts to index, per workchain.
+/// The listed accounts - the ones kept for good - per workchain.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Watched {
     by_workchain: BTreeMap<i32, Vec<UInt256>>,
+    all: HashSet<(i32, UInt256)>,
 }
 
 impl Watched {
     /// One address per line; '#' starts a comment; a bad line is an error naming it.
     pub fn parse(text: &str) -> Result<Self> {
-        let mut seen = HashSet::new();
+        let mut all = HashSet::new();
         let mut by_workchain: BTreeMap<i32, Vec<UInt256>> = BTreeMap::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -114,19 +160,23 @@ impl Watched {
                 continue;
             }
             let (workchain, account) = std_address(line).map_err(|e| error!("line {}: {}", n + 1, e))?;
-            if seen.insert((workchain, account.clone())) {
+            if all.insert((workchain, account.clone())) {
                 by_workchain.entry(workchain).or_default().push(account);
             }
         }
-        Ok(Self { by_workchain })
+        Ok(Self { by_workchain, all })
     }
 
     pub fn len(&self) -> usize {
-        self.by_workchain.values().map(Vec::len).sum()
+        self.all.len()
     }
 
     pub fn in_workchain(&self, workchain: i32) -> &[UInt256] {
         self.by_workchain.get(&workchain).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn contains(&self, workchain: i32, account: &UInt256) -> bool {
+        self.all.contains(&(workchain, account.clone()))
     }
 }
 
@@ -156,29 +206,32 @@ fn key_lt(key: &[u8]) -> u64 {
     u64::from_be_bytes(lt)
 }
 
-/// One transaction of an indexed account, ready to store.
+/// One transaction, ready to store.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxRow {
     pub key: TxKey,
     pub hash: UInt256,
     pub in_msg_hash: Option<UInt256>,
     pub boc: Vec<u8>,
+    /// when the transaction was made (its `now`): what the age of a row is counted from
+    pub utime: u32,
+    /// of a listed account: kept for good. Otherwise it is swept when it gets old.
+    pub listed: bool,
 }
 
-/// The transactions of the watched accounts in one block of `workchain` (a masterchain
-/// block holds only -1 accounts, a shard block only its workchain's). The account block
-/// dictionary is keyed by the 256-bit address alone, so only that workchain's watched
-/// accounts are looked up.
-pub fn block_rows(block: &Block, workchain: i32, watched: &Watched) -> Result<Vec<TxRow>> {
+/// The transactions in one block of `workchain` (a masterchain block holds only -1
+/// accounts, a shard block only its workchain's): those of the listed accounts and, with
+/// `others`, of every other account as well. The account block dictionary is keyed by the
+/// 256-bit address alone, so only that workchain's listed accounts are looked up.
+pub fn block_rows(block: &Block, workchain: i32, watched: &Watched, others: bool) -> Result<Vec<TxRow>> {
     let accounts = watched.in_workchain(workchain);
     let Ok(wc) = i8::try_from(workchain) else { return Ok(Vec::new()) };
-    if accounts.is_empty() {
+    if accounts.is_empty() && !others {
         return Ok(Vec::new());
     }
     let account_blocks = block.read_extra()?.read_account_blocks()?;
     let mut rows = Vec::new();
-    for account in accounts {
-        let Some(account_block) = account_blocks.get(account)? else { continue };
+    let mut take = |account: &UInt256, account_block: &AccountBlock, listed: bool| -> Result<()> {
         account_block.transaction_iterate_full(|lt, cell, _fees| {
             let transaction = Transaction::construct_from_cell(cell.clone())?;
             rows.push(TxRow {
@@ -186,18 +239,126 @@ pub fn block_rows(block: &Block, workchain: i32, watched: &Watched) -> Result<Ve
                 hash: cell.repr_hash(),
                 in_msg_hash: transaction.in_msg_cell().map(|msg| msg.repr_hash()),
                 boc: write_boc(&cell)?,
+                utime: transaction.now(),
+                listed,
             });
             Ok(true)
         })?;
+        Ok(())
+    };
+    if others {
+        account_blocks.iterate_objects(|account_block: AccountBlock| {
+            let account = UInt256::from_slice(&account_block.account_id().get_bytestring(0));
+            take(&account, &account_block, watched.contains(workchain, &account))?;
+            Ok(true)
+        })?;
+    } else {
+        for account in accounts {
+            if let Some(account_block) = account_blocks.get(account)? {
+                take(account, &account_block, true)?;
+            }
+        }
     }
     Ok(rows)
+}
+
+/// The record of a row of an account that is not listed, by which the sweep finds it. Its
+/// key starts with the row's lt: the records are in the order their rows get old.
+struct OtherRow {
+    key: TxKey,
+    utime: u32,
+    bytes: u32,
+    hash: UInt256,
+    in_msg_hash: Option<UInt256>,
+}
+
+const OTHER_KEY_LEN: usize = 1 + KEY_LEN;
+
+/// The lt such a record's key starts with.
+fn record_lt(record: &[u8]) -> Result<u64> {
+    match <[u8; OTHER_KEY_LEN]>::try_from(record) {
+        Ok(record) => Ok(key_lt(&OtherRow::row_key(&record))),
+        Err(_) => fail!("bad record of a row in the history index ({} bytes)", record.len()),
+    }
+}
+
+impl OtherRow {
+    /// The key of the row a record is of.
+    fn row_key(record: &[u8; OTHER_KEY_LEN]) -> TxKey {
+        let mut key = [0u8; KEY_LEN];
+        key[..33].copy_from_slice(&record[9..]);
+        key[33..].copy_from_slice(&record[1..9]);
+        key
+    }
+
+    /// OTHER_PREFIX, lt, workchain, account.
+    fn record_key(key: &TxKey) -> [u8; OTHER_KEY_LEN] {
+        let mut record = [OTHER_PREFIX; OTHER_KEY_LEN];
+        record[1..9].copy_from_slice(&key[33..]);
+        record[9..].copy_from_slice(&key[..33]);
+        record
+    }
+
+    /// utime, bytes of the BOC, transaction hash, inbound message hash when there is one.
+    fn record_value(row: &TxRow) -> Vec<u8> {
+        let mut value = Vec::with_capacity(72);
+        value.extend_from_slice(&row.utime.to_be_bytes());
+        value.extend_from_slice(&(row.boc.len() as u32).to_be_bytes());
+        value.extend_from_slice(row.hash.as_slice());
+        if let Some(in_msg) = &row.in_msg_hash {
+            value.extend_from_slice(in_msg.as_slice());
+        }
+        value
+    }
+
+    fn parse(record: &[u8], value: &[u8]) -> Result<Self> {
+        let Ok(record) = <[u8; OTHER_KEY_LEN]>::try_from(record) else {
+            fail!("bad record of a row in the history index ({} bytes)", record.len());
+        };
+        if value.len() != 40 && value.len() != 72 {
+            fail!("bad record of a row in the history index (a value of {} bytes)", value.len());
+        }
+        let number = |bytes: &[u8]| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Ok(Self {
+            key: Self::row_key(&record),
+            utime: number(&value[..4]),
+            bytes: number(&value[4..8]),
+            hash: UInt256::from_slice(&value[8..40]),
+            in_msg_hash: (value.len() == 72).then(|| UInt256::from_slice(&value[40..72])),
+        })
+    }
+
+    fn workchain(&self) -> i32 {
+        i32::from(self.key[0] as i8)
+    }
+
+    fn account(&self) -> UInt256 {
+        UInt256::from_slice(&self.key[1..33])
+    }
+}
+
+/// What a sweep did with the rows of the accounts that are not listed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Swept {
+    /// too old, or beyond the size limit: gone
+    pub dropped: usize,
+    /// of an account that is listed by now: kept for good from here on
+    pub kept: usize,
 }
 
 // ---- the index ------------------------------------------------------------------------
 
 pub struct TxHistory {
     db: DB,
-    smallest_lt: AtomicU64,
+    /// the smallest lt among the rows kept for good, and among the other ones
+    listed_smallest_lt: AtomicU64,
+    other_smallest_lt: AtomicU64,
+    /// the rows of the accounts that are not listed: how many, and the bytes of their BOCs
+    other_count: AtomicU64,
+    other_bytes: AtomicU64,
+    /// where the next sweep looks first: past the records the sweeps before it took off
+    sweep_from: Mutex<Vec<u8>>,
+    retention: Option<Retention>,
     accounts: AtomicUsize,
 }
 
@@ -232,7 +393,9 @@ fn decode_mc_block(data: &[u8]) -> Result<BlockIdExt> {
 }
 
 impl TxHistory {
-    pub fn open(path: &Path) -> Result<Self> {
+    /// `retention`: what is kept of the accounts that are not listed; None - their rows
+    /// are not wanted, and those the index has are swept away.
+    pub fn open(path: &Path, retention: Option<Retention>) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -243,8 +406,26 @@ impl TxHistory {
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
         let db = DB::open_cf_descriptors(&options, path, families)
             .map_err(|e| error!("cannot open {}: {}", path.display(), e))?;
-        let history = Self { db, smallest_lt: AtomicU64::new(u64::MAX), accounts: AtomicUsize::new(0) };
-        history.smallest_lt.store(history.scan_smallest_lt()?, Ordering::Relaxed);
+        let history = Self {
+            db,
+            listed_smallest_lt: AtomicU64::new(u64::MAX),
+            other_smallest_lt: AtomicU64::new(u64::MAX),
+            other_count: AtomicU64::new(0),
+            other_bytes: AtomicU64::new(0),
+            sweep_from: Mutex::new(vec![OTHER_PREFIX]),
+            retention,
+            accounts: AtomicUsize::new(0),
+        };
+        history.other_count.store(history.number(META_OTHER_COUNT)?.unwrap_or(0), Ordering::Relaxed);
+        history.other_bytes.store(history.number(META_OTHER_BYTES)?.unwrap_or(0), Ordering::Relaxed);
+        history.other_smallest_lt.store(history.first_other_lt(&[OTHER_PREFIX])?, Ordering::Relaxed);
+        // an index made before the other accounts were indexed does not have this number
+        // yet - nor any rows but the listed accounts': their keys are read through once
+        let listed = match history.number(META_LISTED_SMALLEST_LT)? {
+            Some(lt) => lt,
+            None => history.scan_smallest_lt()?,
+        };
+        history.listed_smallest_lt.store(listed, Ordering::Relaxed);
         Ok(history)
     }
 
@@ -252,23 +433,65 @@ impl TxHistory {
         self.db.cf_handle(name).ok_or_else(|| error!("no column family {} in the history index", name))
     }
 
+    fn number(&self, name: &[u8]) -> Result<Option<u64>> {
+        match self.db.get(name)? {
+            Some(data) => match <[u8; 8]>::try_from(&data[..]) {
+                Ok(bytes) => Ok(Some(u64::from_be_bytes(bytes))),
+                Err(_) => fail!("bad {} in the history index", String::from_utf8_lossy(name)),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// The records of the rows of the accounts that are not listed, oldest first.
+    fn other_records() -> ReadOptions {
+        let mut options = ReadOptions::default();
+        options.set_iterate_upper_bound(vec![OTHER_PREFIX + 1]);
+        options
+    }
+
+    /// The lt of the first of those records at or after `from`, u64::MAX when there is none.
+    fn first_other_lt(&self, from: &[u8]) -> Result<u64> {
+        let mut iter = self.db.raw_iterator_opt(Self::other_records());
+        iter.seek(from);
+        let lt = iter.key().map_or(Ok(u64::MAX), record_lt);
+        iter.status()?;
+        lt
+    }
+
     /// Stores the rows of one masterchain block and moves the progress marker to that
     /// block, in one write: both happen or neither does. A gap - masterchain seqnos
     /// `from..=to` whose transactions are missing or incomplete - goes into that write too:
     /// the marker never moves past blocks the node no longer had without the gap being on
-    /// record.
+    /// record. A row of an account that is not listed gets a record the sweep finds it by.
     pub fn commit(&self, rows: &[TxRow], mc_block: &BlockIdExt, gap: Option<(u32, u32)>) -> Result<()> {
         let (transactions, by_hash, by_in_msg) =
             (self.cf(CF_TRANSACTIONS)?, self.cf(CF_BY_HASH)?, self.cf(CF_BY_IN_MSG)?);
         let mut batch = WriteBatch::default();
-        let mut smallest = u64::MAX;
+        let mut listed_smallest = self.listed_smallest_lt.load(Ordering::Relaxed);
+        let mut other_smallest = u64::MAX;
+        let mut count = self.other_count.load(Ordering::Relaxed);
+        let mut bytes = self.other_bytes.load(Ordering::Relaxed);
+        let mut records = HashSet::new();
         for row in rows {
             batch.put_cf(transactions, row.key, &row.boc);
             batch.put_cf(by_hash, row.hash.as_slice(), row.key);
             if let Some(in_msg) = &row.in_msg_hash {
                 batch.put_cf(by_in_msg, in_msg.as_slice(), row.key);
             }
-            smallest = smallest.min(key_lt(&row.key));
+            if row.listed {
+                listed_smallest = listed_smallest.min(key_lt(&row.key));
+                continue;
+            }
+            let record = OtherRow::record_key(&row.key);
+            // a row that is there already counts once: the same block again after a
+            // restart, a block walked twice after a split
+            if records.insert(record) && self.db.get_pinned(record)?.is_none() {
+                count += 1;
+                bytes += row.boc.len() as u64;
+            }
+            batch.put(record, OtherRow::record_value(row));
+            other_smallest = other_smallest.min(key_lt(&row.key));
         }
         if let Some((from, to)) = gap {
             let mut gaps = self.gaps()?;
@@ -276,9 +499,91 @@ impl TxHistory {
             batch.put(META_GAPS, serde_json::to_vec(&gaps)?);
         }
         batch.put(META_LAST_MC_BLOCK, encode_mc_block(mc_block));
+        batch.put(META_LISTED_SMALLEST_LT, listed_smallest.to_be_bytes());
+        batch.put(META_OTHER_COUNT, count.to_be_bytes());
+        batch.put(META_OTHER_BYTES, bytes.to_be_bytes());
         self.db.write(batch)?;
-        self.smallest_lt.fetch_min(smallest, Ordering::Relaxed);
+        self.listed_smallest_lt.store(listed_smallest, Ordering::Relaxed);
+        self.other_smallest_lt.fetch_min(other_smallest, Ordering::Relaxed);
+        self.other_count.store(count, Ordering::Relaxed);
+        self.other_bytes.store(bytes, Ordering::Relaxed);
+        // a record before the place the sweeps have got to: they start over, or it would
+        // never be looked at
+        if let Some(first) = records.iter().min() {
+            let mut from = self.sweep_from.lock().map_err(|_| error!("history index: the sweep lock is poisoned"))?;
+            if first[..] < from[..] {
+                *from = vec![OTHER_PREFIX];
+            }
+        }
         Ok(())
+    }
+
+    /// Takes rows of the accounts that are not listed off the index: those made longer ago
+    /// than is kept, counted from `now`, and the oldest ones while there are more bytes of
+    /// them than the limit - every one of them when such accounts are not indexed (any
+    /// more). A row of an account that is listed by now stays, kept for good from here on.
+    /// One write; at most SWEEP_MAX_ROWS rows, what is left waits for the next call.
+    pub fn sweep(&self, now: u32, watched: &Watched) -> Result<Swept> {
+        self.sweep_rows(now, watched, SWEEP_MAX_ROWS)
+    }
+
+    fn sweep_rows(&self, now: u32, watched: &Watched, most: usize) -> Result<Swept> {
+        let (keep_sec, max_bytes) = self.retention.map_or((0, 0), |kept| (kept.keep_sec, kept.max_bytes));
+        let (transactions, by_hash, by_in_msg) =
+            (self.cf(CF_TRANSACTIONS)?, self.cf(CF_BY_HASH)?, self.cf(CF_BY_IN_MSG)?);
+        let mut from = self.sweep_from.lock().map_err(|_| error!("history index: the sweep lock is poisoned"))?;
+        let mut iter = self.db.raw_iterator_opt(Self::other_records());
+        iter.seek(&from[..]);
+        let mut batch = WriteBatch::default();
+        let mut listed_smallest = self.listed_smallest_lt.load(Ordering::Relaxed);
+        let mut count = self.other_count.load(Ordering::Relaxed);
+        let mut bytes = self.other_bytes.load(Ordering::Relaxed);
+        let mut swept = Swept::default();
+        let mut last = None;
+        while swept.dropped + swept.kept < most {
+            let (Some(record), Some(value)) = (iter.key(), iter.value()) else { break };
+            let row = OtherRow::parse(record, value)?;
+            let too_old = u64::from(row.utime) + keep_sec < u64::from(now);
+            if !too_old && bytes <= max_bytes {
+                break;
+            }
+            if watched.contains(row.workchain(), &row.account()) {
+                listed_smallest = listed_smallest.min(key_lt(&row.key));
+                swept.kept += 1;
+            } else {
+                batch.delete_cf(transactions, row.key);
+                batch.delete_cf(by_hash, row.hash.as_slice());
+                // a message an account took twice names the later transaction: it goes
+                // only with the row it names
+                if let Some(in_msg) = &row.in_msg_hash {
+                    if self.db.get_pinned_cf(by_in_msg, in_msg.as_slice())?.as_deref() == Some(&row.key[..]) {
+                        batch.delete_cf(by_in_msg, in_msg.as_slice());
+                    }
+                }
+                swept.dropped += 1;
+            }
+            batch.delete(record);
+            count = count.saturating_sub(1);
+            bytes = bytes.saturating_sub(u64::from(row.bytes));
+            last = Some(record.to_vec());
+            iter.next();
+        }
+        iter.status()?;
+        let Some(last) = last else { return Ok(swept) };
+        // the first record that stays: the oldest row of these accounts from now on
+        let other_smallest = iter.key().map_or(Ok(u64::MAX), record_lt)?;
+        drop(iter);
+        batch.put(META_LISTED_SMALLEST_LT, listed_smallest.to_be_bytes());
+        batch.put(META_OTHER_COUNT, count.to_be_bytes());
+        batch.put(META_OTHER_BYTES, bytes.to_be_bytes());
+        self.db.write(batch)?;
+        self.listed_smallest_lt.store(listed_smallest, Ordering::Relaxed);
+        self.other_smallest_lt.store(other_smallest, Ordering::Relaxed);
+        self.other_count.store(count, Ordering::Relaxed);
+        self.other_bytes.store(bytes, Ordering::Relaxed);
+        // the next sweep seeks past what this one deleted, not through it
+        *from = last;
+        Ok(swept)
     }
 
     /// The first commit of an empty index: history starts after `base`.
@@ -346,11 +651,12 @@ impl TxHistory {
 
     /// The smallest lt in the index, u64::MAX while it is empty (as jrpc.everwallet.net).
     pub fn smallest_known_lt(&self) -> u64 {
-        self.smallest_lt.load(Ordering::Relaxed)
+        self.listed_smallest_lt.load(Ordering::Relaxed).min(self.other_smallest_lt.load(Ordering::Relaxed))
     }
 
+    /// The smallest lt of all rows, by reading through their keys: for an index that has
+    /// the listed accounts' rows only (see `open`).
     fn scan_smallest_lt(&self) -> Result<u64> {
-        // a few accounts: a key scan at start is cheap
         let mut smallest = u64::MAX;
         let mut iter = self.db.raw_iterator_cf(self.cf(CF_TRANSACTIONS)?);
         iter.seek_to_first();
@@ -375,6 +681,9 @@ impl TxHistory {
             "gaps": self.gaps()?,
             "transactions": transactions,
             "smallestKnownLt": if smallest == u64::MAX { Value::Null } else { json!(smallest.to_string()) },
+            "otherAccountsDays": self.retention.map(|kept| kept.keep_sec / DAY_SEC),
+            "otherTransactions": self.other_count.load(Ordering::Relaxed),
+            "otherBytes": self.other_bytes.load(Ordering::Relaxed),
         }))
     }
 }
@@ -518,44 +827,62 @@ impl History {
     /// Opens (or creates) the index. The accounts file must be readable now: a typo shows
     /// at start instead of as a silently empty history.
     pub fn open(config: &HistoryConfig, db_root: &str) -> Result<Self> {
-        let watched = read_accounts(Path::new(&config.accounts_file))?;
+        let retention = config.retention();
+        let watched = match &config.accounts_file {
+            Some(file) => read_accounts(Path::new(file))?,
+            None if retention.is_some() => Watched::default(),
+            None => fail!("no accounts_file and other_accounts_days is 0: there is nothing to index"),
+        };
         let path = match &config.db_path {
             Some(path) => PathBuf::from(path),
             None => Path::new(db_root).join("jrpc_history"),
         };
-        let index = Arc::new(TxHistory::open(&path)?);
+        let index = Arc::new(TxHistory::open(&path, retention)?);
         index.accounts.store(watched.len(), Ordering::Relaxed);
-        log::info!("JRPC history: {} accounts from {}, index {}", watched.len(), config.accounts_file, path.display());
+        let listed = match &config.accounts_file {
+            Some(file) => format!("{} accounts of {} kept for good", watched.len(), file),
+            None => "no account kept for good".to_string(),
+        };
+        let others = match retention {
+            Some(_) => format!("every other account for {} days", config.other_accounts_days),
+            None => "no other account indexed".to_string(),
+        };
+        log::info!("JRPC history: {}, {}, index {}", listed, others, path.display());
         Ok(Self { index, config: config.clone() })
     }
 }
 
 struct AccountsFile {
-    path: PathBuf,
+    path: Option<PathBuf>,
     modified: Option<SystemTime>,
     checked: Instant,
     watched: Arc<Watched>,
 }
 
 impl AccountsFile {
-    fn load(path: &Path, index: &TxHistory) -> Result<Self> {
-        let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        let watched = Arc::new(read_accounts(path)?);
+    /// Without a file no account is listed.
+    fn load(path: Option<&str>, index: &TxHistory) -> Result<Self> {
+        let path = path.map(PathBuf::from);
+        let (modified, watched) = match &path {
+            Some(path) => (std::fs::metadata(path).and_then(|m| m.modified()).ok(), read_accounts(path)?),
+            None => (None, Watched::default()),
+        };
         index.accounts.store(watched.len(), Ordering::Relaxed);
-        Ok(Self { path: path.to_path_buf(), modified, checked: Instant::now(), watched })
+        Ok(Self { path, modified, checked: Instant::now(), watched: Arc::new(watched) })
     }
 
     /// Picks up an edited file; a file that does not parse keeps the previous list.
     fn refresh(&mut self, index: &TxHistory) {
+        let Some(path) = &self.path else { return };
         if self.checked.elapsed() < ACCOUNTS_CHECK_PERIOD {
             return;
         }
         self.checked = Instant::now();
-        let modified = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         if modified == self.modified {
             return;
         }
-        match read_accounts(&self.path) {
+        match read_accounts(path) {
             Ok(watched) => {
                 log::info!("JRPC history: accounts file changed, {} -> {} accounts", self.watched.len(), watched.len());
                 index.accounts.store(watched.len(), Ordering::Relaxed);
@@ -621,9 +948,9 @@ impl Indexer {
     }
 
     async fn run(&self) -> Result<()> {
-        let mut accounts = AccountsFile::load(Path::new(&self.config.accounts_file), &self.index)?;
+        let mut accounts = AccountsFile::load(self.config.accounts_file.as_deref(), &self.index)?;
         let Some((mut prev_handle, mut prev_block)) = self.resume(&accounts.watched).await? else { return Ok(()) };
-        log::info!("JRPC history indexer: {} accounts, continuing after masterchain block {}",
+        log::info!("JRPC history indexer: {} listed accounts, continuing after masterchain block {}",
             accounts.watched.len(), prev_handle.id().seq_no());
         loop {
             if self.engine.check_stop() {
@@ -677,23 +1004,33 @@ impl Indexer {
             }
         }
         let seqno = mc.id().seq_no();
-        self.store(blocks, mc.id().clone(), watched.clone(), (!complete).then_some((seqno, seqno))).await?;
+        self.store(blocks, mc, watched.clone(), (!complete).then_some((seqno, seqno))).await?;
         Ok(Some(complete))
     }
 
-    /// Filters and commits off the async runtime (block parsing, RocksDB write).
+    /// Filters and commits off the async runtime (block parsing, RocksDB write), then
+    /// sweeps the rows of the accounts that are not listed: their age is counted from the
+    /// time of the masterchain block `mc`.
     async fn store(
-        &self, blocks: Vec<BlockStuff>, mc_block: BlockIdExt, watched: Arc<Watched>, gap: Option<(u32, u32)>
+        &self, blocks: Vec<BlockStuff>, mc: &BlockStuff, watched: Arc<Watched>, gap: Option<(u32, u32)>
     ) -> Result<()> {
         let index = self.index.clone();
+        let others = self.config.retention().is_some();
+        let (mc_block, now) = (mc.id().clone(), mc.gen_utime()?);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut rows = Vec::new();
             for block in &blocks {
                 if block.is_usual_block() {
-                    rows.extend(block_rows(block.block()?, block.id().shard().workchain_id(), &watched)?);
+                    rows.extend(block_rows(block.block()?, block.id().shard().workchain_id(), &watched, others)?);
                 }
             }
-            index.commit(&rows, &mc_block, gap)
+            index.commit(&rows, &mc_block, gap)?;
+            let swept = index.sweep(now, &watched)?;
+            if swept != Swept::default() {
+                log::debug!("JRPC history: masterchain block {} - {} old rows dropped, {} kept for good",
+                    mc_block.seq_no(), swept.dropped, swept.kept);
+            }
+            Ok(())
         }).await.map_err(|e| error!("history indexer task: {}", e))?
     }
 
@@ -842,7 +1179,7 @@ impl Indexer {
         if self.engine.check_stop() {
             return Ok(None);
         }
-        self.store(vec![block.clone()], handle.id().clone(), watched.clone(), Some((from, to))).await?;
+        self.store(vec![block.clone()], &block, watched.clone(), Some((from, to))).await?;
         log::error!("JRPC history: masterchain blocks {}..{} are a gap in the history - \
             the node no longer stores their blocks", from, to);
         Ok(Some((handle, block)))
